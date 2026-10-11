@@ -1,0 +1,50 @@
+# Python and development tooling
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+*.egg-info/
+
+# Packaging output (keep PyInstaller .spec files tracked)
+build/
+dist/
+
+# Local credentials and runtime state
+.env
+.env.*
+!.env.example
+client_secret*.json
+client_secrets*.json
+credentials.json
+token.json
+tokens.json
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3-wal
+*.sqlite3-shm
+*.log
+*.log.*
+
+# Recordings: use generated temporary fixtures in tests
+*.mp4
+*.mkv
+*.mov
+*.avi
+
+# Local editor and OS files
+.idea/
+.vscode/
+Thumbs.db
+Desktop.ini
