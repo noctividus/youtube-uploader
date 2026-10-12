@@ -85,28 +85,176 @@ File stability is practical evidence, not proof that a producer will never reope
 
 In **Settings → Webhooks**, click **Add**, enter the endpoint, and select events. Use **Add authentication header** for any headers your receiver requires, for example name `Authorization` with value `Bearer your-token`, or name `X-API-Key` with your key as the value. Values are masked and encrypted in settings and pending deliveries using [Windows user-bound DPAPI](https://learn.microsoft.com/en-us/windows/win32/api/dpapi/nf-dpapi-cryptprotectdata). Save applies changes; Cancel discards them. Use HTTPS for remote destinations. Endpoint URLs remain in local settings, so put authentication in headers rather than URL parameters.
 
-Events are JSON HTTP POSTs:
+Events are JSON HTTP POST request bodies sent to your endpoint. The examples below use illustrative IDs and timestamps. Every event includes `id` (event UUID, unchanged on retries), `event`, `version` (currently `1`), `occurred_at` (UTC time when the app queued the event), and `data`.
+
+When present, `data.recording` contains the local queue ID, filename (without the directory), last observed size in bytes, title, and source (`vmix` or `filesystem`). At recording start, the filename may be empty and size may be zero. At vMix stop, the file may still be finishing, so the reported size is not guaranteed to be final. Fields shown only for a particular event are absent from other events, rather than set to `null`.
+
+### Recording Started — vMix
+
+Sent when the app observes a recording start, including attachment to an active recording on startup. `observed: true` indicates an observed vMix state; it does not distinguish a new start from startup attachment.
 
 ```json
 {
-  "id": "unique-event-uuid",
-  "event": "upload_finished",
+  "id": "11111111-1111-4111-8111-111111111111",
+  "event": "recording_started",
   "version": 1,
   "occurred_at": "2026-10-12T02:00:00+00:00",
   "data": {
+    "observed": true,
+    "recording": {"id": 1, "filename": "recording.mp4", "size": 0, "title": "Recording", "source": "vmix"}
+  }
+}
+```
+
+### Recording Started — filesystem fallback
+
+Sent for a newly observed or changed watched file. `evidence` replaces the vMix-only `observed` field. This detects a file, not the producer's actual recording-start time. Existing files discovered during the initial scan do not generate this event.
+
+```json
+{
+  "id": "22222222-2222-4222-8222-222222222222",
+  "event": "recording_started",
+  "version": 1,
+  "occurred_at": "2026-10-12T02:00:00+00:00",
+  "data": {
+    "evidence": "new_file_observed",
+    "recording": {"id": 2, "filename": "recording.mp4", "size": 4096, "title": "Recording", "source": "filesystem"}
+  }
+}
+```
+
+### Recording Finished — vMix
+
+Sent on a confirmed vMix stop for each tracked recording segment. Connection loss never counts as a stop. This event does not include `observed` or `evidence`.
+
+```json
+{
+  "id": "33333333-3333-4333-8333-333333333333",
+  "event": "recording_finished",
+  "version": 1,
+  "occurred_at": "2026-10-12T02:10:00+00:00",
+  "data": {
+    "recording": {"id": 1, "filename": "recording.mp4", "size": 12345, "title": "Recording", "source": "vmix"}
+  }
+}
+```
+
+### Recording Finished — filesystem fallback
+
+Sent when a new/changed watched file passes stability and access checks. Existing files discovered during the initial scan do not generate this event.
+
+```json
+{
+  "id": "44444444-4444-4444-8444-444444444444",
+  "event": "recording_finished",
+  "version": 1,
+  "occurred_at": "2026-10-12T02:11:00+00:00",
+  "data": {
+    "evidence": "file_stability",
+    "recording": {"id": 2, "filename": "recording.mp4", "size": 12345, "title": "Recording", "source": "filesystem"}
+  }
+}
+```
+
+### Upload Started
+
+Sent when an approved upload attempt starts, before transfer finishes. `attempt_id` identifies the upload attempt; `channel_id` is its destination channel. `privacy` is the requested visibility: `private`, `unlisted`, or `public`.
+
+```json
+{
+  "id": "55555555-5555-4555-8555-555555555555",
+  "event": "upload_started",
+  "version": 1,
+  "occurred_at": "2026-10-12T02:12:00+00:00",
+  "data": {
+    "attempt_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    "channel_id": "UC_example_channel_id",
+    "privacy": "private",
+    "recording": {"id": 1, "filename": "recording.mp4", "size": 12345, "title": "Recording", "source": "vmix"}
+  }
+}
+```
+
+### Upload Finished
+
+Sent when YouTube returns the video ID, before optional playlist placement. It confirms upload acceptance, not completion of YouTube's video processing. Playlist failures do not repeat this event or turn it into a failed video upload. The payload does not include channel, privacy, or playlist fields.
+
+```json
+{
+  "id": "66666666-6666-4666-8666-666666666666",
+  "event": "upload_finished",
+  "version": 1,
+  "occurred_at": "2026-10-12T02:13:00+00:00",
+  "data": {
     "recording": {"id": 1, "filename": "recording.mp4", "size": 12345, "title": "Recording", "source": "vmix"},
-    "attempt_id": "upload-attempt-uuid",
+    "attempt_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
     "youtube_id": "video-id",
     "youtube_url": "https://www.youtube.com/watch?v=video-id"
   }
 }
 ```
 
-- **Recording Started** (`recording_started`): observed vMix recording start, including attachment to an active recording on startup. In filesystem mode this means a new/changed watched file was observed, with `evidence: new_file_observed`; it cannot prove the producer started recording.
-- **Recording Finished** (`recording_finished`): confirmed vMix stop for each tracked segment, or new watched file completion in filesystem mode (`evidence: file_stability`). Existing files discovered at startup do not generate filesystem recording events. Connection loss never generates a recording-finished event.
-- **Upload Started** (`upload_started`): an approved upload attempt starts, with channel, privacy and attempt ID.
-- **Upload Finished** (`upload_finished`): YouTube returns the video ID, before optional playlist placement. A playlist failure does not repeat the event or turn it into a failed video upload.
-- **Error** (`error`): upload/authentication failures, failed application commands, monitoring errors and vMix/folder outages. Repeated outage polls are suppressed. Webhook delivery failures are shown locally and never trigger recursive Error calls.
+### Error — upload attempt
+
+An upload-attempt failure includes `operation: upload`, `attempt_id`, `recording`, a sanitized `message`, and `ambiguous`. When `ambiguous` is true, the outcome is uncertain and the user must check YouTube Studio before retrying; false means the app did not classify the outcome as uncertain.
+
+```json
+{
+  "id": "77777777-7777-4777-8777-777777777777",
+  "event": "error",
+  "version": 1,
+  "occurred_at": "2026-10-12T02:13:00+00:00",
+  "data": {
+    "operation": "upload",
+    "attempt_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    "message": "YouTube API quota exceeded. Try again after the quota resets.",
+    "ambiguous": false,
+    "recording": {"id": 1, "filename": "recording.mp4", "size": 12345, "title": "Recording", "source": "vmix"}
+  }
+}
+```
+
+### Error — connection, monitoring, or application operation
+
+Other errors contain only `operation` and `message` inside `data`. They omit `recording`, `attempt_id`, and `ambiguous`. An upload command rejected before an attempt starts also uses this smaller shape, with `operation: upload`.
+
+```json
+{
+  "id": "88888888-8888-4888-8888-888888888888",
+  "event": "error",
+  "version": 1,
+  "occurred_at": "2026-10-12T02:14:00+00:00",
+  "data": {
+    "operation": "vmix",
+    "message": "vMix connection failed; retrying."
+  }
+}
+```
+
+| Error origin | `data.operation` | `data.message` |
+| --- | --- | --- |
+| vMix polling failure | `vmix` | `vMix connection failed; retrying.` |
+| Watched-folder failure | `filesystem` | `A watched folder is unavailable.` |
+| Monitoring worker stopped | `monitor` | `Monitoring stopped; check the app.` |
+| YouTube sign-in failure | `youtube_connect` | Sanitized explanation of the connection failure |
+| OAuth client import failure | `youtube_import` | Sanitized explanation of the import failure |
+| YouTube disconnect failure | `youtube_disconnect` | Sanitized explanation of the disconnect failure |
+| Failed worker command | Command name, such as `upload`, `review`, `settings`, `youtube`, `pause`, `remove`, `scan`, `vmix_test`, or `youtube_event` | `Application operation failed; check the app.` |
+
+Error messages are human-readable and may change; route automation using `event`, `operation`, and the presence of attempt fields. Repeated outage polls are suppressed. Webhook delivery failures are shown locally and never trigger recursive Error calls.
+
+### HTTP headers and receiver responses
+
+Every request includes `Content-Type: application/json`, `X-Webhook-Id`, and `X-Webhook-Event`, plus your configured authentication headers. For example:
+
+```http
+Content-Type: application/json
+X-Webhook-Id: 66666666-6666-4666-8666-666666666666
+X-Webhook-Event: upload_finished
+Authorization: Bearer your-token
+```
+
+Your endpoint can acknowledge a delivery with `204 No Content` or any other 2xx response. No JSON response body is required; response bodies are not read.
 
 `X-Webhook-Id` and `X-Webhook-Event` mirror the JSON fields. A 2xx response is success. Network errors, HTTP 408/429 and 5xx responses get at most three attempts, with 2- and 4-second delays. Other responses fail without retries. Redirects are not followed. Receivers should deduplicate by event ID because timeouts or a crash after delivery can produce duplicate requests.
 
