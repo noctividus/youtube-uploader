@@ -34,6 +34,52 @@ def version(record):
     return record.identity, record.size, record.mtime_ns, record.fingerprint
 
 
+def test_initial_scan_is_quiet_but_new_watched_files_trigger_review(database, tmp_path):
+    video(tmp_path / "existing.mp4")
+    settings = Settings(directories=[str(tmp_path)], stability_seconds=1)
+    monitor = Monitor(database, settings)
+    monitor.tick(0, scan=True)
+    existing_ids = monitor.tick(1)
+    assert len(existing_ids) == 1
+    assert not monitor.auto_review_ids
+    monitor.tick(2, scan=True)  # Opening the queue does not retrigger old files.
+    assert not monitor.auto_review_ids
+    video(tmp_path / "new.mp4")
+    monitor.tick(3, scan=True)
+    new_ids = monitor.tick(4)
+    assert len(new_ids) == 1
+    assert new_ids[0] in monitor.auto_review_ids
+    assert new_ids[0] != existing_ids[0]
+    restarted = Monitor(database, settings)
+    database.recover()
+    restarted.tick(5, scan=True)
+    restarted.tick(6)
+    assert not restarted.auto_review_ids
+
+
+def test_added_folder_is_baselined_and_removed_folder_cannot_trigger(database, tmp_path):
+    first, second = tmp_path / "one", tmp_path / "two"
+    first.mkdir()
+    second.mkdir()
+    old = video(second / "old.mp4")
+    monitor = Monitor(database, Settings(directories=[str(first)], stability_seconds=1))
+    monitor.tick(0, scan=True)
+    monitor.configure(Settings(directories=[str(first), str(second)], stability_seconds=1))
+    monitor.tick(1, scan=True)
+    monitor.tick(2)
+    assert not monitor.auto_review_ids
+    video(second / "new.mp4")
+    monitor.tick(3, scan=True)
+    new_ids = monitor.tick(4)
+    assert new_ids[0] in monitor.auto_review_ids
+    monitor.configure(Settings(directories=[str(first)], stability_seconds=1))
+    assert not monitor.auto_review_ids
+    old.write_bytes(b"changed content")
+    monitor.tick(5, scan=True)
+    monitor.tick(6)
+    assert not monitor.auto_review_ids
+
+
 def ready_monitor(database, directory):
     monitor = Monitor(database, Settings(directories=[str(directory)], stability_seconds=10))
     monitor.tick(0, scan=True)

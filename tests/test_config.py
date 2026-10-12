@@ -1,6 +1,30 @@
 import pytest
 
-from vmix_youtube_uploader.config import Settings, load_settings, save_settings
+from vmix_youtube_uploader.config import Settings, WebhookEndpoint, load_settings, save_settings
+
+
+def test_webhooks_roundtrip_and_old_settings_default(tmp_path):
+    path = tmp_path / "settings.json"
+    path.write_text("{}", encoding="utf-8")
+    assert load_settings(path).webhooks == []
+    settings = Settings(webhooks=[
+        WebhookEndpoint("https://example.com/hook", ["recording_started", "error"]),
+        WebhookEndpoint("http://localhost:8080/hook", ["upload_finished"]),
+    ])
+    save_settings(path, settings)
+    assert load_settings(path) == settings
+
+
+@pytest.mark.parametrize("endpoint", [
+    WebhookEndpoint("", ["error"]),
+    WebhookEndpoint("file:///example", ["error"]),
+    WebhookEndpoint("https://example.com:invalid", ["error"]),
+    WebhookEndpoint("https://example.com", []),
+    WebhookEndpoint("https://example.com", ["unknown"]),
+])
+def test_webhook_validation(endpoint):
+    with pytest.raises(ValueError):
+        Settings(webhooks=[endpoint]).validate()
 
 
 def test_extension_filter_roundtrip_and_older_settings(tmp_path):

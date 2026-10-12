@@ -1,14 +1,18 @@
-# Milestone 1 architecture and decisions
+# Architecture and decisions
 
 ## Ownership and storage
 
-`models.py`, `database.py`, `files.py`, and `monitor.py` contain domain logic without Qt dependencies. A single `Worker` QThread owns the SQLite connection, filesystem checks, configuration writes, and watchdog lifecycle. UI commands enter a thread-safe queue; immutable recording snapshots return through Qt signals. Watchdog callbacks only mark discovery dirty. Network operations do not exist yet.
+`models.py`, `database.py`, `files.py`, `monitor.py`, and `vmix.py` contain domain logic without Qt dependencies. A single `Worker` QThread owns the SQLite connection, vMix HTTP polling, filesystem checks, configuration writes, and watchdog lifecycle. UI commands enter a thread-safe queue; immutable recording snapshots return through Qt signals. Watchdog callbacks only mark discovery dirty. vMix requests use bounded connect/read timeouts and run off the GUI thread.
 
-The database uses WAL, FULL synchronous writes, transactions, schema constraints, and `PRAGMA user_version` migrations. Version 1 includes fields for the intended upload lifecycle. Unknown newer schema versions fail visibly rather than rewriting data. Application settings use an fsynced temporary JSON file followed by atomic replacement. Neither source videos nor user credentials are stored in the repository.
+The database uses WAL, FULL synchronous writes, transactions, schema constraints, and `PRAGMA user_version` migrations. Version 1 includes fields for the intended upload lifecycle; version 2 adds recording source and vMix lifecycle state without dropping history. Unknown newer schema versions fail visibly rather than rewriting data. Application settings use an fsynced temporary JSON file followed by atomic replacement. Neither source videos nor user credentials are stored in the repository.
 
 Exit stops accepting interaction, signals the worker, and keeps the UI event loop responsive while watchdog shuts down and SQLite closes. There is no forced worker termination. OS calls to inaccessible network storage can still delay shutdown; production validation should use the intended recording disks.
 
 ## Identity and file readiness
+
+The user's newer instruction makes vMix the default trigger, superseding filesystem discovery and stability timers. The filesystem rules below apply only when vMix is explicitly disabled. In vMix mode, the API's primary recording filename supplies the path, a recording-start observation creates a durable provisional queue row, and a confirmed stop schedules upload confirmation. Rows acquire the real file identity once the path can be statted, preserving the provisional row ID where possible and merging with any previously known file identity to avoid duplicate queue entries.
+
+vMix mode retains filename changes as primary recording segments and schedules each observed segment on stop. It does not infer filenames from directory contents. Stop confirmation opens a window even if the file is not yet readable; metadata actions wait for nonempty contents, exclusive access, and a consistent sampled fingerprint. A late filesystem update refreshes the open window without losing edited metadata. Startup idle states and connection failures never generate synthetic recording-stop events. Active rows become interrupted after disconnect/restart, and are reattached only when vMix explicitly names the active file again. Previously confirmed stops can finish their access checks after restart without reopening windows automatically.
 
 The Windows key combines volume/device ID, file ID, and file birth timestamp. Size and nanosecond modification timestamp identify the observed content version. A normalized absolute path is a fallback only when the filesystem provides no file ID; rename recognition is then limited. Two independently copied files are separate recordings even if their contents match. No full-video hash is computed.
 
@@ -19,6 +23,8 @@ Reviews include the identity, size, timestamp, and sampled fingerprint that the 
 Scans are non-recursive. Known queue entries continue to be checked after removal of their watch folder, but new files there are not discovered. Directory errors are isolated. Missing files lose readiness and stay visible as unavailable; restoration starts a new stability interval. Duplicate filesystem events do not create duplicate database rows. Stable file identities let renames preserve suppression.
 
 ## Queue transitions and recovery
+
+Readiness and automatic review eligibility are separate. The first successful scan of each watched directory/extension combination establishes its baseline: existing files become ready without a popup. New arrivals and subsequent content changes in already watched scopes become eligible for automatic review after completion. Adding a folder or enabling an extension establishes a new quiet baseline for it; unrelated settings changes preserve existing baselines. Unwatched queue entries remain tracked but cannot trigger automatic review. Restart clears session eligibility. Opening the queue requests a scan without resetting the baseline. Only the Review button opens manual review; row double-click has no review action.
 
 | Trigger | Result |
 | --- | --- |
@@ -39,7 +45,7 @@ The worker resets readiness observation after a long scheduling gap (over five s
 
 ## Future integrations
 
-vMix is absent in milestone 1. When enabled in milestone 3, active recording must gate readiness, and a disconnected/unknown state must not be treated as a recording-stop transition. Default to holding newly detected candidates while an enabled vMix connection is unknown; disabling the integration explicitly returns to filesystem-only detection. Implement and test that policy when the integration arrives.
+The vMix integration has been implemented ahead of the original milestone order at the user's request. It uses read-only HTTP XML polling (default two seconds); vMix control functions and automatic path mapping are not implemented. Primary recordings without an absolute filename remain explicit unresolved queue entries. Secondary recorder/MultiCorder support and webhook dispatch are future work.
 
 OAuth, approval-to-upload transitions, resumable sessions, retries, durable upload-attempt history, Google API errors, and actual progress are milestone 2 work. The reserved statuses/columns are not substitutes for those implementations.
 

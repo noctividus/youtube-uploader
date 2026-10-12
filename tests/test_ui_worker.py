@@ -1,13 +1,105 @@
 import subprocess
 import sys
 import time
+from dataclasses import replace
 
-from PySide6.QtCore import QLockFile
+import pytest
+
+from PySide6.QtCore import QLockFile, Qt
+from PySide6.QtWidgets import QPushButton
+from PySide6.QtTest import QTest
 
 from vmix_youtube_uploader.config import Settings, save_settings
 from vmix_youtube_uploader.models import Snapshot, Status
 from vmix_youtube_uploader.ui import QueueWindow, ReviewWindow, SettingsWindow
 from vmix_youtube_uploader.worker import Worker
+
+
+@pytest.mark.parametrize("status,available", [
+    (Status.WAITING, True), (Status.READY, True), (Status.SKIPPED, True), (Status.WAITING, False),
+])
+def test_mouse_selection_enables_upload_for_any_selected_record(app, database, tmp_path, status, available):
+    path = tmp_path / "video.mp4"
+    path.write_bytes(b"video")
+    record = replace(database.observe(Snapshot.read(path), ""), status=status, available=available)
+    window = QueueWindow()
+    requested = []
+    window.review_requested.connect(requested.append)
+    try:
+        window.update_records([record])
+        assert not window.review_button.isEnabled()
+        window.show()
+        app.processEvents()
+        position = window.table.visualItemRect(window.table.item(0, 1)).center()
+        QTest.mouseClick(window.table.viewport(), Qt.MouseButton.LeftButton, pos=position)
+        assert window.review_button.isEnabled()
+        window.review_button.click()
+        assert requested == [record.id]
+    finally:
+        window.close()
+        window.deleteLater()
+
+
+def test_open_confirmation_updates_readiness_without_losing_edits(app, database, tmp_path):
+    path = tmp_path / "video.mp4"
+    path.write_bytes(b"video")
+    record = database.observe(Snapshot.read(path), "")
+    window = ReviewWindow(record)
+    try:
+        window.title.setText("My edited title")
+        assert not window.later.isEnabled()
+        assert "Checking file completion" in window.notice.text()
+        database.ready(record.id, "fingerprint")
+        window.update_record(database.get(record.id))
+        assert window.title.text() == "My edited title"
+        assert window.later.isEnabled()
+        assert window.record.fingerprint == "fingerprint"
+    finally:
+        window.deleteLater()
+
+
+def test_queue_shortcuts_sorting_and_selected_review(app, database, tmp_path):
+    records = []
+    for name, size in (("large.mp4", 10_000_000), ("small.mp4", 2_000_000)):
+        path = tmp_path / name
+        path.write_bytes(b"video")
+        snapshot = Snapshot.read(path)
+        record = database.observe(Snapshot(snapshot.path, snapshot.identity, size, snapshot.mtime_ns), "")
+        database.ready(record.id, "fingerprint")
+        records.append(database.get(record.id))
+    window = QueueWindow()
+    reviewed, scans, settings = [], [], []
+    window.review_requested.connect(reviewed.append)
+    window.scan_requested.connect(lambda: scans.append(True))
+    window.settings_requested.connect(lambda: settings.append(True))
+    try:
+        window.update_records(records)
+        assert {button.text() for button in window.findChildren(QPushButton)} == {"Settings", "Upload"}
+        window.show()
+        assert scans == [True]
+        window.settings_button.click()
+        assert settings == [True]
+        for column in range(window.table.columnCount()):
+            for order in (Qt.SortOrder.AscendingOrder, Qt.SortOrder.DescendingOrder):
+                window.table.sortItems(column, order)
+                values = [window.table.item(row, column).sort_value for row in range(2)]
+                assert values == sorted(values, reverse=order == Qt.SortOrder.DescendingOrder)
+        window.table.sortItems(3, Qt.SortOrder.AscendingOrder)
+        window.table.selectRow(0)
+        assert window.selected().id == records[1].id  # 2 MB sorts before 10 MB.
+        assert window.table.item(0, 1).text() == tmp_path.name
+        window.update_records(records)
+        assert window.selected().id == records[1].id
+        window.table.itemDoubleClicked.emit(window.table.item(0, 0))
+        assert not reviewed
+        window.review_button.click()
+        assert reviewed == [records[1].id]
+        window.close()
+        window.show()
+        assert len(scans) == 2
+    finally:
+        window.close()
+        window.deleteLater()
 
 
 def wait_for(app, predicate, seconds=8):
@@ -36,24 +128,83 @@ def test_settings_extension_checkboxes_save_and_restore(app):
         window.deleteLater()
 
 
+def test_tabbed_settings_add_remove_validate_and_restore_webhooks(app):
+    window = SettingsWindow(Settings(description="Keep my description", notifications=False))
+    saved = []
+    window.saved.connect(saved.append)
+    try:
+        assert [window.tabs.tabText(i) for i in range(4)] == ["Files", "Triggers", "Webhooks", "General"]
+        window.add_webhook_button.click()
+        window.save()
+        assert not saved
+        assert window.validation_error.text()
+        first = window.webhook_editors[0]
+        first.url.setText("https://example.com/hook")
+        first.events["recording_started"].setChecked(True)
+        first.events["error"].setChecked(True)
+        window.add_webhook_button.click()
+        window.remove_webhook(window.webhook_editors[1])
+        window.save()
+        assert saved[0].webhooks[0].events == ["recording_started", "error"]
+        assert saved[0].description == "Keep my description"
+        assert not saved[0].notifications
+        restored = SettingsWindow(saved[0])
+        try:
+            assert restored.webhook_editors[0].url.text() == "https://example.com/hook"
+            assert restored.webhook_editors[0].events["error"].isChecked()
+            assert not restored.webhook_editors[0].events["upload_started"].isChecked()
+        finally:
+            restored.deleteLater()
+    finally:
+        window.deleteLater()
+
+
+def test_vmix_settings_roundtrip_and_connection_test_signal(app):
+    window = SettingsWindow(Settings(vmix_enabled=True, vmix_url="http://localhost:8088/api/"))
+    saved, tested = [], []
+    window.saved.connect(saved.append)
+    window.vmix_test_requested.connect(tested.append)
+    try:
+        assert not window.stability.isEnabled()
+        window.vmix_test.click()
+        assert tested == ["http://localhost:8088/api/"]
+        assert not window.vmix_test.isEnabled()
+        window.show_vmix_test_result("Connected")
+        assert window.vmix_test.isEnabled()
+        window.vmix_poll.setValue(1)
+        window.save()
+        assert saved[0].vmix_enabled
+        assert saved[0].vmix_poll_seconds == 1
+        window.vmix_enabled.setChecked(False)
+        assert window.stability.isEnabled()
+    finally:
+        window.deleteLater()
+
+
 def test_worker_discovers_watchdog_events_and_persists_review(app, tmp_path):
     watched = tmp_path / "recordings"
     watched.mkdir()
+    (watched / "existing.mp4").write_bytes(b"existing video")
     data = tmp_path / "data"
     save_settings(data / "settings.json", Settings(
         directories=[str(watched)], stability_seconds=1, periodic_scan=False, notifications=False,
+        vmix_enabled=False,
     ))
     worker = Worker(data)
-    updates, errors, saved = [], [], []
+    updates, errors, saved, automatic = [], [], [], []
     worker.records_changed.connect(updates.append)
     worker.error.connect(errors.append)
     worker.reviewed.connect(saved.append)
+    worker.ready.connect(automatic.append)
     worker.start()
     try:
         wait_for(app, lambda: bool(updates))
-        (watched / "video.mp4").write_bytes(b"video bytes")
         wait_for(app, lambda: bool(updates[-1]) and updates[-1][0].status == Status.READY)
+        assert automatic == []
+        (watched / "video.mp4").write_bytes(b"video bytes")
+        wait_for(app, lambda: len(updates[-1]) == 2 and updates[-1][0].status == Status.READY)
         record = updates[-1][0]
+        assert automatic == [record.id]
         worker.submit("review", (record.id, (record.identity, record.size, record.mtime_ns, record.fingerprint),
                                   "later", "Edited", "Description", "private"))
         wait_for(app, lambda: bool(saved))

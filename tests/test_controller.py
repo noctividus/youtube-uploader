@@ -6,11 +6,13 @@ from PySide6.QtCore import QCoreApplication, QEvent
 from vmix_youtube_uploader.config import Settings, save_settings
 from vmix_youtube_uploader.main import Controller
 from vmix_youtube_uploader.models import Snapshot
+from dataclasses import replace
+from vmix_youtube_uploader.models import Status
 
 
 def test_controller_holds_reviews_while_locked_and_shows_one_window(app, database, tmp_path, monkeypatch):
     data = tmp_path / "app"
-    save_settings(data / "settings.json", Settings(notifications=False))
+    save_settings(data / "settings.json", Settings(notifications=False, vmix_enabled=False))
     controller = Controller(app, data)
     controller.timer.stop()
     records = []
@@ -22,7 +24,7 @@ def test_controller_holds_reviews_while_locked_and_shows_one_window(app, databas
         records.append(database.get(record.id))
     try:
         controller.records_changed(records)
-        controller.settings = Settings(notifications=False)
+        controller.settings = Settings(directories=[str(tmp_path)], notifications=False)
         controller.pending.update(r.id for r in records)
         monkeypatch.setattr("vmix_youtube_uploader.main.desktop_available", lambda: False)
         controller.present_next()
@@ -38,6 +40,23 @@ def test_controller_holds_reviews_while_locked_and_shows_one_window(app, databas
         controller.present_next()
         assert controller.review_window is not first
         assert controller.review_window.record.id == records[1].id
+        controller.show_review(records[0].id)
+        assert controller.review_window.record.id == records[0].id
+        controller.review_window.close()
+        controller.records[records[0].id] = replace(records[0], status=Status.WAITING)
+        controller.show_review(records[0].id, automatic=True)
+        assert not controller.review_window.isVisible()
+        controller.show_review(records[0].id)
+        assert controller.review_window.isVisible()
+        assert not controller.review_window.later.isEnabled()
+        controller.review_window.close()
+        stopped = replace(records[0], source="vmix", vmix_state="stopped", status=Status.WAITING, available=False)
+        controller.settings = Settings(directories=[], notifications=False)
+        controller.vmix_recording_stopped(stopped.id)
+        controller.records_changed([stopped])
+        assert controller.review_window.isVisible()
+        assert controller.review_window.record.id == stopped.id
+        assert "vMix stopped" in controller.review_window.notice.text()
     finally:
         if controller.review_window:
             controller.review_window.close()
@@ -60,7 +79,7 @@ def test_real_windows_tray_startup_and_graceful_exit(tmp_path):
     if os.name != "nt":
         pytest.skip("Windows desktop smoke check")
     data = tmp_path / "app"
-    save_settings(data / "settings.json", Settings(notifications=False))
+    save_settings(data / "settings.json", Settings(notifications=False, vmix_enabled=False))
     # Launch the real entry point with the Windows platform plugin. Exit through
     # the tray controller, with a hard subprocess timeout to catch stuck workers.
     script = '''

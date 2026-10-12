@@ -66,6 +66,8 @@ class Controller(QObject):
         self.loaded = False
         self.records: dict[int, Recording] = {}
         self.pending: set[int] = set()
+        self.vmix_pending: set[int] = set()
+        self.vmix_status_text = "Waiting for vMix"
         self.presented: set[int] = set()
         self.review_window = None
         self.settings_window = None
@@ -73,7 +75,8 @@ class Controller(QObject):
         self.worker = Worker(data_dir)
         self.queue_window = QueueWindow()
         self.queue_window.review_requested.connect(self.show_review)
-        self.queue_window.remove_requested.connect(lambda record_id: self.worker.submit("remove", record_id))
+        self.queue_window.settings_requested.connect(self.show_settings)
+        self.queue_window.settings_button.setEnabled(False)
         self.queue_window.scan_requested.connect(lambda: self.worker.submit("scan"))
         self.tray = QSystemTrayIcon(tray_icon(), self)
         self.menu = QMenu()
@@ -97,6 +100,9 @@ class Controller(QObject):
         self.worker.records_changed.connect(self.records_changed)
         self.worker.settings_changed.connect(self.settings_changed)
         self.worker.ready.connect(self.record_ready)
+        self.worker.recording_stopped.connect(self.vmix_recording_stopped)
+        self.worker.vmix_status.connect(self.vmix_status_changed)
+        self.worker.vmix_test_result.connect(self.vmix_test_result)
         self.worker.error.connect(self.show_error)
         self.worker.status.connect(self.status_changed)
         self.worker.reviewed.connect(self.review_saved)
@@ -114,7 +120,24 @@ class Controller(QObject):
 
     @Slot(int)
     def record_ready(self, record_id: int) -> None:
+        self.presented.discard(record_id)
         self.pending.add(record_id)
+
+    @Slot(int)
+    def vmix_recording_stopped(self, record_id: int) -> None:
+        self.record_ready(record_id)
+        self.vmix_pending.add(record_id)
+
+    @Slot(str)
+    def vmix_status_changed(self, message: str) -> None:
+        self.vmix_status_text = message
+        if self.settings_window:
+            self.settings_window.vmix_connection.setText(message)
+
+    @Slot(str)
+    def vmix_test_result(self, message: str) -> None:
+        if self.settings_window:
+            self.settings_window.show_vmix_test_result(message)
 
     def pause(self, paused: bool) -> None:
         self.pause_action.setText("Resume Monitoring" if paused else "Pause Monitoring")
@@ -133,6 +156,12 @@ class Controller(QObject):
     def records_changed(self, records: list[Recording]) -> None:
         self.records = {record.id: record for record in records}
         self.queue_window.update_records(records)
+        if self.review_window and self.review_window.isVisible():
+            current = self.records.get(self.review_window.record.id)
+            if current:
+                self.review_window.update_record(current)
+        if self.vmix_pending:
+            self.present_next()
 
     @Slot(object)
     def settings_changed(self, settings: Settings) -> None:
@@ -140,9 +169,10 @@ class Controller(QObject):
         self.loaded = True
         self.settings = settings
         self.settings_action.setEnabled(True)
+        self.queue_window.settings_button.setEnabled(True)
         if self.settings_window and self.settings_window.isVisible():
             self.settings_window.accept()
-        if first and not settings.directories and settings.notifications:
+        if first and not settings.vmix_enabled and not settings.directories and settings.notifications:
             self.tray.showMessage("Ready to configure", "Open Settings from the tray menu to choose a recording folder.")
 
     def show_settings(self) -> None:
@@ -151,6 +181,8 @@ class Controller(QObject):
             self.settings_window.activateWindow()
             return
         self.settings_window = SettingsWindow(self.settings)
+        self.settings_window.vmix_connection.setText(self.vmix_status_text)
+        self.settings_window.vmix_test_requested.connect(lambda url: self.worker.submit("vmix_test", url))
         self.settings_window.saved.connect(lambda settings: self.worker.submit("settings", settings))
         self.settings_window.show()
 
@@ -173,9 +205,15 @@ class Controller(QObject):
             return
         for record_id in sorted(self.pending):
             record = self.records.get(record_id)
-            if record is None or record.status != Status.READY or not record.available:
+            vmix_stopped = record_id in self.vmix_pending and record is not None and record.vmix_state == "stopped"
+            if record is None or (not vmix_stopped and (record.status != Status.READY or not record.available)):
                 continue
             self.pending.discard(record_id)
+            self.vmix_pending.discard(record_id)
+            watched_directories = {os.path.normcase(os.path.abspath(path)) for path in self.settings.directories}
+            if not vmix_stopped and (os.path.normcase(str(Path(record.path).parent)) not in watched_directories
+                    or Path(record.path).suffix.lower() not in self.settings.file_extensions):
+                continue
             if record.deferred or record_id in self.presented:
                 continue
             if self.settings.notifications:
@@ -185,16 +223,20 @@ class Controller(QObject):
 
     @Slot(int)
     def show_review(self, record_id: int, automatic: bool = False) -> None:
+        record = self.records.get(record_id)
+        if not record or (automatic and record.vmix_state != "stopped" and (record.status != Status.READY or not record.available)):
+            return
         if self.review_window and self.review_window.isVisible():
-            if not automatic:
+            if automatic:
+                return
+            if self.review_window.record.id == record_id:
                 self.review_window.raise_()
                 self.review_window.activateWindow()
-            return
-        record = self.records.get(record_id)
-        if not record or record.status != Status.READY or not record.available:
-            return
+                return
+            self.review_window.reject()
         self.presented.add(record_id)
         self.pending.discard(record_id)
+        self.vmix_pending.discard(record_id)
         self.review_window = ReviewWindow(record)
         self.review_window.action_requested.connect(lambda payload: self.worker.submit("review", payload))
         self.review_window.show()

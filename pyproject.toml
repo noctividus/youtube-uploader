@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Windows tray recording detection and persistent review queue"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = ["PySide6>=6.8,<7", "watchdog>=6,<7"]
+dependencies = ["PySide6>=6.8,<7", "watchdog>=6,<7", "requests>=2.32,<3"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8,<10"]

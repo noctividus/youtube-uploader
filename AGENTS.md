@@ -4,7 +4,7 @@
 
 Build a reliable Windows system-tray application for reviewing and uploading completed recordings to YouTube. The full requirements are in `docs/project-brief.md`; the staged implementation plan is in `docs/implementation-plan.md`.
 
-The user has authorized milestone 1: the local tray-to-review workflow. Implement and validate that slice; OAuth, actual uploads, vMix integration, and packaging remain subsequent milestones. See `docs/architecture.md` for the implemented detection and recovery rules.
+The user has authorized the local tray-to-review workflow and vMix recording-state integration. vMix mode now supersedes folder watching and stability timers by default: queue on recording start, open upload confirmation on a confirmed stop. OAuth, actual uploads, webhook delivery, and packaging remain subsequent work. See `docs/architecture.md` for the implemented detection and recovery rules.
 
 ## Stack and architecture
 
@@ -18,7 +18,7 @@ The user has authorized milestone 1: the local tray-to-review workflow. Implemen
 
 - Never upload without explicit approval. Default privacy is Private.
 - Never delete or modify source recordings as part of uploading or removing queue entries.
-- File creation alone does not mean completion. Require configurable stability (default 60 seconds), Windows access checks where practical, and available vMix recording-state evidence. Revalidate the file immediately before upload.
+- In filesystem mode, require configurable stability (default 60 seconds) and Windows access checks. In vMix mode, the user's newer instruction replaces the stability timer with a confirmed recording-stop event. Keep access checks and revalidate the file immediately before upload.
 - Identify files using more than filenames. Reconcile persisted state on startup without resurfacing unchanged uploaded or skipped recordings.
 - Queue newly discovered existing recordings for review; never auto-upload them.
 - Persist metadata, approval, progress, and upload outcomes transactionally. An altered file must not inherit approval for an earlier version.

@@ -2,7 +2,7 @@
 
 ## Current checkpoint
 
-The user has authorized milestone 1. Its local tray-to-review workflow is implemented; see `README.md` for setup and validation and `docs/architecture.md` for the concrete state, identity, and recovery decisions. Later milestones remain planned.
+The local tray-to-review workflow is implemented. The user subsequently requested vMix recording-state integration ahead of the original order: it is now the default trigger and replaces folder monitoring/stability delays when enabled. See `README.md` for setup and validation and `docs/architecture.md` for state and recovery decisions. YouTube uploads, webhook dispatch, packaging, and broader operational validation remain planned.
 
 ## First step: a durable local recording-review workflow
 
@@ -49,4 +49,4 @@ Add the PyInstaller configuration, PowerShell build script, bundled icon/resourc
 - Specify how queue removal suppresses rediscovery without deleting source files.
 - Define database ownership across workers, migrations, and shutdown ordering before adding asynchronous writes.
 
-These decisions are documented in `docs/architecture.md`, with automated tests for their observable behavior. The vMix policy is a requirement for milestone 3; no vMix state is currently consulted.
+These decisions are documented in `docs/architecture.md`, with automated tests for their observable behavior. The newer vMix workflow supersedes the original directory-association plan by using the primary recording filename supplied by the API. Missing filenames are reported rather than guessed.

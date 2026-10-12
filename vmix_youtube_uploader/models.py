@@ -68,3 +68,5 @@ class Recording:
     fingerprint: str | None
     created_at: str
     updated_at: str
+    source: str = "filesystem"
+    vmix_state: str = ""
