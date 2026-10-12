@@ -27,7 +27,7 @@ class Database:
 
     def _migrate(self) -> None:
         version = self.connection.execute("PRAGMA user_version").fetchone()[0]
-        if version > 2:
+        if version > 3:
             raise RuntimeError("This database belongs to a newer application version.")
         if version == 0:
             with self.connection:
@@ -61,6 +61,17 @@ class Database:
                 self.connection.execute("ALTER TABLE recordings ADD COLUMN source TEXT NOT NULL DEFAULT 'filesystem'")
                 self.connection.execute("ALTER TABLE recordings ADD COLUMN vmix_state TEXT NOT NULL DEFAULT ''")
                 self.connection.execute("PRAGMA user_version=2")
+        if version < 3:
+            with self.connection:
+                self.connection.execute("BEGIN IMMEDIATE")
+                self.connection.execute("ALTER TABLE recordings ADD COLUMN current_attempt TEXT NOT NULL DEFAULT ''")
+                self.connection.execute("ALTER TABLE recordings ADD COLUMN upload_ambiguous INTEGER NOT NULL DEFAULT 0")
+                self.connection.execute("""CREATE TABLE upload_attempts (
+                    id TEXT PRIMARY KEY, recording_id INTEGER NOT NULL, job TEXT NOT NULL,
+                    status TEXT NOT NULL, bytes_uploaded INTEGER NOT NULL DEFAULT 0,
+                    video_id TEXT, youtube_url TEXT, error TEXT, ambiguous INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL)""")
+                self.connection.execute("PRAGMA user_version=3")
 
     def close(self) -> None:
         self.connection.close()
@@ -75,7 +86,7 @@ class Database:
     def _record(row: sqlite3.Row) -> Recording:
         values = dict(row)
         values["status"] = Status(values["status"])
-        for key in ("deferred", "hidden", "available", "approved"):
+        for key in ("deferred", "hidden", "available", "approved", "upload_ambiguous"):
             values[key] = bool(values[key])
         return Recording(**values)
 
@@ -110,7 +121,7 @@ class Database:
                             completed_at=NULL, fingerprint=NULL, approved=0,
                             deferred=0, hidden=0, available=1, bytes_uploaded=0,
                             youtube_id=NULL, youtube_url=NULL, error=NULL,
-                            retry_count=0, updated_at=? WHERE id=?
+                            retry_count=0, current_attempt='', upload_ambiguous=0, updated_at=? WHERE id=?
                     """, (snapshot.path, snapshot.size, snapshot.mtime_ns, Status.WAITING,
                           timestamp, record_id))
                 elif row["path"] != snapshot.path or not row["available"]:
@@ -141,17 +152,21 @@ class Database:
                 WHERE id=? AND status=? AND available=1
             """, (Status.READY, now(), fingerprint, now(), record_id, Status.WAITING))
 
-    def recover(self) -> None:
+    def recover(self, uploads: bool = True) -> None:
         with self.connection:
             self.connection.execute("""
                 UPDATE recordings SET vmix_state='interrupted', error=?
                 WHERE source='vmix' AND vmix_state='recording'
             """, ("App restarted during a recording; recording completion is unconfirmed.",))
-            self.connection.execute("""
-                UPDATE recordings SET status=?, approved=0, error=?, updated_at=?
-                WHERE status IN (?, ?)
-            """, (Status.FAILED, "Interrupted operation: review required; do not automatically retry.",
-                  now(), Status.APPROVED, Status.UPLOADING))
+            if uploads:
+                self.connection.execute("""
+                    UPDATE recordings SET upload_ambiguous=(status=?), status=?, approved=0, error=?, updated_at=?
+                    WHERE status IN (?, ?)
+                """, (Status.UPLOADING, Status.FAILED, "Interrupted operation: do not automatically retry; check YouTube Studio first.",
+                      now(), Status.APPROVED, Status.UPLOADING))
+                self.connection.execute("""UPDATE upload_attempts SET ambiguous=(status='uploading'),
+                    status='failed', error='Interrupted operation', updated_at=?
+                    WHERE status IN ('queued', 'uploading')""", (now(),))
             self.connection.execute("""
                 UPDATE recordings SET status=?, completed_at=NULL, updated_at=?
                 WHERE status IN (?, ?)
@@ -179,9 +194,10 @@ class Database:
         with self.connection:
             self.connection.execute("""
                 UPDATE recordings SET source='vmix', vmix_state=?, error=?, updated_at=?,
+                    current_attempt=CASE WHEN ?='recording' THEN '' ELSE current_attempt END,
                     approved=0, status=CASE WHEN ?='recording' THEN ? ELSE status END
                 WHERE id=?
-            """, (state, error, now(), state, Status.WAITING, record_id))
+            """, (state, error, now(), state, state, Status.WAITING, record_id))
 
     def observe_vmix(self, record_id: int, path: str, description: str) -> int:
         record = self.get(record_id)
@@ -210,7 +226,7 @@ class Database:
                     UPDATE recordings SET identity=?, path=?, size=?, mtime_ns=?, available=1,
                         title=CASE WHEN identity LIKE 'vmix:%' THEN ? ELSE title END,
                         description=CASE WHEN identity LIKE 'vmix:%' THEN ? ELSE description END,
-                        status=?, approved=0, fingerprint=NULL, completed_at=NULL,
+                        status=?, approved=0, fingerprint=NULL, completed_at=NULL, current_attempt='', upload_ambiguous=0,
                         hidden=0, deferred=0, updated_at=? WHERE id=?
                 """, (snapshot.identity, path, snapshot.size, snapshot.mtime_ns,
                       Path(path).stem.replace('_', ' '), description, Status.WAITING, now(), record_id))
@@ -246,3 +262,61 @@ class Database:
                 "UPDATE recordings SET hidden=1, status=?, approved=0, updated_at=? WHERE id=?",
                 (Status.SKIPPED, now(), record_id),
             )
+
+    def approve_upload(self, record_id, version, title, description, privacy, channel_id,
+                       playlist_id="", acknowledge_duplicate=False):
+        import json
+        from dataclasses import asdict
+        from .youtube import UploadJob
+        record = self.get(record_id)
+        if version != (record.identity, record.size, record.mtime_ns, record.fingerprint):
+            raise ValueError("The file changed. Close this window and review it again.")
+        if record.status not in {Status.READY, Status.FAILED} or record.vmix_state in {"recording", "interrupted"}:
+            raise ValueError("This recording is not ready for upload.")
+        if not record.fingerprint or not channel_id:
+            raise ValueError("A completed recording and connected channel are required.")
+        if record.upload_ambiguous and not acknowledge_duplicate:
+            raise ValueError("Check YouTube Studio and acknowledge the duplicate risk before retrying.")
+        if not 1 <= len(title.strip()) <= 100 or any(c in title for c in "<>"):
+            raise ValueError("Title must contain 1–100 characters, without < or >.")
+        if len(description.encode("utf-8")) > 5000 or any(c in description for c in "<>"):
+            raise ValueError("Description must be at most 5,000 UTF-8 bytes, without < or >.")
+        if privacy not in {"private", "unlisted", "public"}:
+            raise ValueError("Choose a valid privacy setting.")
+        job = UploadJob(str(uuid.uuid4()), record.id, record.path, record.identity, record.size,
+                        record.mtime_ns, record.fingerprint, title.strip(), description, privacy,
+                        channel_id, playlist_id)
+        with self.connection:
+            self.connection.execute("""INSERT INTO upload_attempts
+                (id,recording_id,job,status,created_at,updated_at) VALUES (?,?,?,'queued',?,?)""",
+                (job.attempt_id, record.id, json.dumps(asdict(job)), now(), now()))
+            self.connection.execute("""UPDATE recordings SET status=?, approved=1, current_attempt=?,
+                title=?, description=?, privacy=?, bytes_uploaded=0, error=NULL, upload_ambiguous=0,
+                available=1, updated_at=? WHERE id=?""",
+                (Status.APPROVED, job.attempt_id, job.title, description, privacy, now(), record.id))
+        return job
+
+    def upload_event(self, kind: str, data: dict) -> None:
+        attempt = data["attempt_id"]
+        with self.connection:
+            if kind == "started":
+                self.connection.execute("UPDATE upload_attempts SET status='uploading', updated_at=? WHERE id=?", (now(), attempt))
+                self.connection.execute("UPDATE recordings SET status=?, updated_at=? WHERE current_attempt=? AND approved=1",
+                                        (Status.UPLOADING, now(), attempt))
+            elif kind == "progress":
+                self.connection.execute("UPDATE upload_attempts SET bytes_uploaded=?, updated_at=? WHERE id=?", (data["bytes"], now(), attempt))
+                self.connection.execute("UPDATE recordings SET bytes_uploaded=? WHERE current_attempt=? AND status=?",
+                                        (data["bytes"], attempt, Status.UPLOADING))
+            elif kind in {"created", "done"}:
+                self.connection.execute("""UPDATE upload_attempts SET status='uploaded', video_id=?, youtube_url=?,
+                    error=?, ambiguous=0, updated_at=? WHERE id=?""",
+                    (data["video_id"], data["url"], data.get("warning", ""), now(), attempt))
+                self.connection.execute("""UPDATE recordings SET status=?, approved=0, bytes_uploaded=size,
+                    youtube_id=?, youtube_url=?, error=?, upload_ambiguous=0, updated_at=? WHERE current_attempt=?""",
+                    (Status.UPLOADED, data["video_id"], data["url"], data.get("warning", ""), now(), attempt))
+            elif kind == "failed":
+                self.connection.execute("""UPDATE upload_attempts SET status='failed', error=?, ambiguous=?, updated_at=?
+                    WHERE id=? AND status<>'uploaded'""", (data["error"], int(data["ambiguous"]), now(), attempt))
+                self.connection.execute("""UPDATE recordings SET status=?, approved=0, error=?, upload_ambiguous=?, updated_at=?
+                    WHERE current_attempt=? AND status<>?""",
+                    (Status.FAILED, data["error"], int(data["ambiguous"]), now(), attempt, Status.UPLOADED))

@@ -90,7 +90,7 @@ class CompletionTracker:
 
 
 def revalidate(record_path: str, version: tuple[str, int, int], fingerprint: str | None) -> bool:
-    """Reusable pre-action check; the future uploader must also call this."""
+    """Shared pre-action check for review decisions and upload approval/transfer."""
     path = Path(record_path)
     try:
         snapshot = Snapshot.read(path)

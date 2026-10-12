@@ -3,7 +3,8 @@
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, QUrl
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QFileDialog, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
@@ -40,6 +41,14 @@ class WebhookEditor(QGroupBox):
         remove.clicked.connect(lambda: self.remove_requested.emit(self))
         row.addWidget(remove)
         layout.addLayout(row)
+        self.header_rows = []
+        self.headers_layout = QVBoxLayout()
+        layout.addLayout(self.headers_layout)
+        for name, value in (endpoint.headers.items() if endpoint else []):
+            self.add_header(name, value)
+        add_header = QPushButton("Add authentication header")
+        add_header.clicked.connect(lambda: self.add_header())
+        layout.addWidget(add_header)
         layout.addWidget(QLabel("Call when:"))
         grid = QGridLayout()
         self.events: dict[str, QCheckBox] = {}
@@ -51,14 +60,37 @@ class WebhookEditor(QGroupBox):
         layout.addLayout(grid)
 
     def value(self) -> WebhookEndpoint:
+        names = [name.text().strip().lower() for _, name, _ in self.header_rows]
+        if len(set(names)) != len(names):
+            raise ValueError("Webhook: header names must be unique.")
         return WebhookEndpoint(self.url.text().strip(), [
             event for event, checkbox in self.events.items() if checkbox.isChecked()
-        ])
+        ], {name.text().strip(): value.text() for _, name, value in self.header_rows})
+
+    def add_header(self, name="", value=""):
+        container = QWidget()
+        row = QHBoxLayout(container)
+        header_name, header_value = QLineEdit(name), QLineEdit(value)
+        header_name.setPlaceholderText("Authorization or X-API-Key")
+        header_value.setPlaceholderText("Bearer your-token or API key")
+        header_value.setEchoMode(QLineEdit.EchoMode.Password)
+        row.addWidget(header_name)
+        row.addWidget(header_value)
+        remove = QPushButton("Remove header")
+        row.addWidget(remove)
+        entry = (container, header_name, header_value)
+        self.header_rows.append(entry)
+        self.headers_layout.addWidget(container)
+        def remove_header():
+            self.header_rows.remove(entry)
+            container.deleteLater()
+        remove.clicked.connect(remove_header)
 
 
 class SettingsWindow(QDialog):
     saved = Signal(object)
     vmix_test_requested = Signal(str)
+    youtube_requested = Signal(object)
 
     def __init__(self, settings: Settings):
         super().__init__()
@@ -148,9 +180,12 @@ class SettingsWindow(QDialog):
         webhooks = QWidget()
         webhooks_layout = QVBoxLayout(webhooks)
         self.tabs.addTab(webhooks, "Webhooks")
-        webhook_note = QLabel("Save endpoints and choose their triggers below. Webhook delivery is not enabled yet.")
+        webhook_note = QLabel("Send JSON event notifications to your endpoints. Add headers such as Authorization: Bearer your-token or X-API-Key. Header values are encrypted for your Windows account when you Save. Use HTTPS for remote endpoints.")
         webhook_note.setWordWrap(True)
         webhooks_layout.addWidget(webhook_note)
+        self.webhook_status = QLabel()
+        self.webhook_status.setWordWrap(True)
+        webhooks_layout.addWidget(self.webhook_status)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         container = QWidget()
@@ -178,6 +213,33 @@ class SettingsWindow(QDialog):
         form.addRow("Default description", self.description)
         general_layout.addLayout(form)
         general_layout.addStretch()
+        youtube_tab = QWidget()
+        youtube_form = QFormLayout(youtube_tab)
+        self.tabs.addTab(youtube_tab, "YouTube")
+        note = QLabel("Enable YouTube Data API v3 in your Google Cloud project, then download an OAuth client JSON for a Desktop app. Import it here and connect the channel you want to upload to. Connection changes take effect immediately.")
+        note.setWordWrap(True)
+        youtube_form.addRow(note)
+        self.youtube_channel = QLabel("Not connected")
+        self.youtube_channel.setTextFormat(Qt.TextFormat.PlainText)
+        self.youtube_channel.setWordWrap(True)
+        youtube_form.addRow("Channel", self.youtube_channel)
+        self.youtube_message = QLabel()
+        self.youtube_message.setTextFormat(Qt.TextFormat.PlainText)
+        self.youtube_message.setWordWrap(True)
+        youtube_form.addRow(self.youtube_message)
+        self.youtube_import = QPushButton("Import OAuth client JSON…")
+        self.youtube_import.clicked.connect(self.import_youtube_client)
+        youtube_form.addRow(self.youtube_import)
+        self.youtube_connect = QPushButton("Connect / Refresh channel")
+        self.youtube_connect.clicked.connect(lambda: self.youtube_requested.emit(("connect", None)))
+        youtube_form.addRow(self.youtube_connect)
+        self.youtube_disconnect = QPushButton("Disconnect")
+        self.youtube_disconnect.clicked.connect(lambda: self.youtube_requested.emit(("disconnect", None)))
+        youtube_form.addRow(self.youtube_disconnect)
+        privacy_note = QLabel("Uploads default to Private. You confirm the channel, title, description and privacy before each upload. Unverified Google API projects may be restricted to private uploads.")
+        privacy_note.setWordWrap(True)
+        youtube_form.addRow(privacy_note)
+        self.set_youtube_state({})
         self.validation_error = QLabel()
         self.validation_error.setWordWrap(True)
         self.validation_error.setStyleSheet("color: #ac2424")
@@ -195,6 +257,19 @@ class SettingsWindow(QDialog):
         self.webhook_editors.append(editor)
         self.webhook_layout.insertWidget(self.webhook_layout.count() - 1, editor)
 
+    def import_youtube_client(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Choose Desktop OAuth client", "", "JSON files (*.json)")
+        if path:
+            self.youtube_requested.emit(("import", path))
+
+    def set_youtube_state(self, state):
+        connected, busy = state.get("connected", False), state.get("busy", False)
+        self.youtube_channel.setText(f"{state.get('channel_name', '')}\n{state.get('channel_id', '')}" if connected else "Not connected")
+        self.youtube_message.setText(state.get("message", "Import your Desktop OAuth client to get started."))
+        self.youtube_import.setEnabled(not busy)
+        self.youtube_connect.setEnabled(not busy and state.get("imported", False))
+        self.youtube_disconnect.setEnabled(not busy and connected)
+
     def remove_webhook(self, editor: WebhookEditor) -> None:
         self.webhook_editors.remove(editor)
         self.webhook_layout.removeWidget(editor)
@@ -205,8 +280,8 @@ class SettingsWindow(QDialog):
         if path and not self.directories.findItems(path, Qt.MatchFlag.MatchFixedString):
             self.directories.addItem(str(Path(path)))
 
-    def save(self) -> None:
-        settings = Settings(
+    def settings_value(self) -> Settings:
+        return Settings(
             directories=[self.directories.item(i).text() for i in range(self.directories.count())],
             stability_seconds=self.stability.value(), scan_seconds=self.interval.value(),
             periodic_scan=self.periodic.isChecked(), notifications=self.notifications.isChecked(),
@@ -218,7 +293,9 @@ class SettingsWindow(QDialog):
             vmix_url=self.vmix_url.text().strip(),
             vmix_poll_seconds=self.vmix_poll.value(),
         )
+    def save(self) -> None:
         try:
+            settings = self.settings_value()
             settings.validate()
         except ValueError as exc:
             self.validation_error.setText(str(exc))
@@ -272,6 +349,10 @@ class QueueWindow(QWidget):
         self.settings_button.clicked.connect(self.settings_requested.emit)
         header.addWidget(self.settings_button)
         layout.addLayout(header)
+        self.transfer = QLabel()
+        self.transfer.setTextFormat(Qt.TextFormat.PlainText)
+        self.transfer.setWordWrap(True)
+        layout.addWidget(self.transfer)
         self.error = QLabel()
         self.error.setWordWrap(True)
         self.error.setStyleSheet("color: #ac2424")
@@ -293,7 +374,8 @@ class QueueWindow(QWidget):
         actions.addWidget(self.review_button)
         actions.addStretch()
         layout.addLayout(actions)
-        layout.addWidget(QLabel("Local review milestone • Uploads are not enabled yet • Closing this window keeps monitoring active"))
+        layout.addWidget(QLabel("Uploads require confirmation • Double-click a YouTube link to open it • Closing this window keeps monitoring active"))
+        self.table.itemDoubleClicked.connect(self.open_youtube)
         self.table.itemSelectionChanged.connect(self.update_actions)
         self.table.currentCellChanged.connect(lambda *_: self.update_actions())
         self.update_actions()
@@ -366,12 +448,22 @@ class QueueWindow(QWidget):
         if record:
             self.review_requested.emit(record.id)
 
+    def open_youtube(self, item):
+        if item.column() == 6:
+            record = self.selected()
+            if record and record.youtube_url:
+                QDesktopServices.openUrl(QUrl(record.youtube_url))
+
 class ReviewWindow(QDialog):
     action_requested = Signal(object)
+    upload_requested = Signal(object)
 
     def __init__(self, record: Recording):
         super().__init__()
         self.record = record
+        self.youtube_state = {}
+        self.version_invalid = False
+        self.submitting = False
         self.setWindowTitle("Upload recording")
         self.setModal(False)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
@@ -395,13 +487,23 @@ class ReviewWindow(QDialog):
         self.privacy.addItems(["Private", "Unlisted", "Public"])
         self.privacy.setCurrentText(record.privacy.title())
         form.addRow("Privacy", self.privacy)
-        self.notice = QLabel("Uploads will be available in the next milestone. Later saves this review for then.")
+        self.channel = QLabel("Connect a channel in Settings → YouTube")
+        self.channel.setTextFormat(Qt.TextFormat.PlainText)
+        form.addRow("YouTube channel", self.channel)
+        self.playlist = QComboBox()
+        self.playlist.addItem("None", "")
+        form.addRow("Playlist (optional)", self.playlist)
+        self.duplicate = QCheckBox("I checked YouTube Studio; I understand retrying may create a duplicate.")
+        self.duplicate.setVisible(bool(record.upload_ambiguous))
+        self.duplicate.toggled.connect(lambda: self.update_upload_enabled())
+        form.addRow(self.duplicate)
+        self.notice = QLabel()
         self.notice.setWordWrap(True)
         form.addRow(self.notice)
         buttons = QHBoxLayout()
-        upload = QPushButton("Upload (coming next)")
-        upload.setEnabled(False)
-        buttons.addWidget(upload)
+        self.upload = QPushButton("Upload")
+        self.upload.clicked.connect(self.submit_upload)
+        buttons.addWidget(self.upload)
         self.later = QPushButton("Later")
         self.later.clicked.connect(lambda: self.submit("later"))
         buttons.addWidget(self.later)
@@ -419,8 +521,12 @@ class ReviewWindow(QDialog):
             self.notice.setText("The file changed. Close this window and select Upload again after it finishes.")
             self.later.setEnabled(False)
             self.skip.setEnabled(False)
+            self.version_invalid = True
+            self.upload.setEnabled(False)
             return
         self.record = record
+        self.duplicate.setVisible(bool(record.upload_ambiguous))
+        self.update_upload_enabled()
         ready = record.available and record.status == Status.READY
         self.later.setEnabled(ready)
         self.skip.setEnabled(ready)
@@ -437,8 +543,36 @@ class ReviewWindow(QDialog):
         elif not ready:
             message = f"Current status: {record.status}."
         else:
-            message = "Later saves these details for a future upload."
-        self.notice.setText(message + " YouTube uploads are not implemented yet.")
+            message = "Choose Upload to send this recording to the channel shown above. Later saves your details."
+        self.notice.setText(record.error or message)
+
+    def set_youtube_state(self, state):
+        self.youtube_state = state
+        self.channel.setText(f"{state.get('channel_name', '')} ({state.get('channel_id', '')})" if state.get("connected")
+                             else "Connect a channel in Settings → YouTube")
+        selected = self.playlist.currentData()
+        self.playlist.clear()
+        self.playlist.addItem("None", "")
+        for playlist in state.get("playlists", []):
+            self.playlist.addItem(playlist["name"], playlist["id"])
+        self.playlist.setCurrentIndex(max(0, self.playlist.findData(selected)))
+        self.update_upload_enabled()
+
+    def update_upload_enabled(self):
+        self.upload.setEnabled(bool(self.youtube_state.get("connected")) and not self.youtube_state.get("busy", False)
+            and not self.version_invalid and not self.submitting
+            and self.record.status in {Status.READY, Status.FAILED}
+            and self.record.vmix_state not in {"recording", "interrupted"}
+            and bool(self.record.fingerprint)
+            and (not self.record.upload_ambiguous or self.duplicate.isChecked()))
+
+    def submit_upload(self):
+        self.submitting = True
+        self.update_upload_enabled()
+        record = self.record
+        self.upload_requested.emit((record.id, (record.identity, record.size, record.mtime_ns, record.fingerprint),
+            self.title.text(), self.description.toPlainText(), self.privacy.currentText().lower(),
+            self.youtube_state.get("channel_id", ""), self.playlist.currentData(), self.duplicate.isChecked()))
 
     def submit(self, action: str) -> None:
         if not self.title.text().strip():
@@ -452,6 +586,8 @@ class ReviewWindow(QDialog):
                                     self.privacy.currentText().lower()))
 
     def failed(self, message: str) -> None:
+        self.submitting = False
+        self.update_upload_enabled()
         self.notice.setText(message)
         self.later.setEnabled(True)
         self.skip.setEnabled(True)

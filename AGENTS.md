@@ -4,7 +4,7 @@
 
 Build a reliable Windows system-tray application for reviewing and uploading completed recordings to YouTube. The full requirements are in `docs/project-brief.md`; the staged implementation plan is in `docs/implementation-plan.md`.
 
-The user has authorized the local tray-to-review workflow and vMix recording-state integration. vMix mode now supersedes folder watching and stability timers by default: queue on recording start, open upload confirmation on a confirmed stop. OAuth, actual uploads, webhook delivery, and packaging remain subsequent work. See `docs/architecture.md` for the implemented detection and recovery rules.
+The user has authorized the local review workflow, vMix integration, YouTube connection/uploads, and authenticated webhook delivery. vMix mode supersedes folder watching and stability timers by default. Desktop OAuth, explicitly approved uploads, and a durable webhook outbox are implemented. Packaging remains subsequent work. See `docs/architecture.md` for detection and recovery rules.
 
 ## Stack and architecture
 
@@ -40,4 +40,4 @@ The user has authorized the local tray-to-review workflow and vMix recording-sta
 
 ## Current implementation checkpoint
 
-Milestone 1 uses `pyproject.toml` for dependencies and package configuration. Run `.\.venv\Scripts\python.exe -m pytest -q` for the offline suite. Do not enable upload actions until the real uploader and its approval/recovery tests exist.
+Dependencies and package configuration live in `pyproject.toml`. Run `.\.venv\Scripts\python.exe -m pytest -q` for the offline suite. Live Google authorization and real video uploads require interactive validation by the user; automated tests must never upload to a real channel.
