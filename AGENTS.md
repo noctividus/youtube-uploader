@@ -4,7 +4,7 @@
 
 Build a reliable Windows system-tray application for reviewing and uploading completed recordings to YouTube. The full requirements are in `docs/project-brief.md`; the staged implementation plan is in `docs/implementation-plan.md`.
 
-The current task is repository setup and planning only. Do not begin application implementation until the user asks to proceed. The brief's request to build the full MVP describes the eventual product, not permission to bypass this planning checkpoint.
+The user has authorized the local tray-to-review workflow and vMix recording-state integration. vMix mode now supersedes folder watching and stability timers by default: queue on recording start, open upload confirmation on a confirmed stop. OAuth, actual uploads, webhook delivery, and packaging remain subsequent work. See `docs/architecture.md` for the implemented detection and recovery rules.
 
 ## Stack and architecture
 
@@ -18,7 +18,7 @@ The current task is repository setup and planning only. Do not begin application
 
 - Never upload without explicit approval. Default privacy is Private.
 - Never delete or modify source recordings as part of uploading or removing queue entries.
-- File creation alone does not mean completion. Require configurable stability (default 60 seconds), Windows access checks where practical, and available vMix recording-state evidence. Revalidate the file immediately before upload.
+- In filesystem mode, require configurable stability (default 60 seconds) and Windows access checks. In vMix mode, the user's newer instruction replaces the stability timer with a confirmed recording-stop event. Keep access checks and revalidate the file immediately before upload.
 - Identify files using more than filenames. Reconcile persisted state on startup without resurfacing unchanged uploaded or skipped recordings.
 - Queue newly discovered existing recordings for review; never auto-upload them.
 - Persist metadata, approval, progress, and upload outcomes transactionally. An altered file must not inherit approval for an earlier version.
@@ -38,6 +38,6 @@ The current task is repository setup and planning only. Do not begin application
 - Do not add transcription, editing, n8n, or speculative integrations to the MVP.
 - Do not publish, push, or create external resources unless requested.
 
-## Initial implementation checkpoint
+## Current implementation checkpoint
 
-Start with milestone 1 in `docs/implementation-plan.md` when implementation is authorized. Agree on the queue states and completion/recovery rules before connecting the UI to external services.
+Milestone 1 uses `pyproject.toml` for dependencies and package configuration. Run `.\.venv\Scripts\python.exe -m pytest -q` for the offline suite. Do not enable upload actions until the real uploader and its approval/recovery tests exist.
