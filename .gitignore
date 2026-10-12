@@ -45,6 +45,7 @@ tokens.json
 
 # Local editor and OS files
 .idea/
-.vscode/
+.vscode/*
+!.vscode/tasks.json
 Thumbs.db
 Desktop.ini

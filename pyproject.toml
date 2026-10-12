@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vmix-youtube-uploader"
+version = "0.1.0"
+description = "Windows tray recording detection and persistent review queue"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = ["PySide6>=6.8,<7", "watchdog>=6,<7"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10"]
+
+[project.gui-scripts]
+vmix-youtube-uploader = "vmix_youtube_uploader.main:main"
+
+[tool.setuptools.packages.find]
+include = ["vmix_youtube_uploader*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

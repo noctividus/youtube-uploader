@@ -4,7 +4,7 @@
 
 Build a reliable Windows system-tray application for reviewing and uploading completed recordings to YouTube. The full requirements are in `docs/project-brief.md`; the staged implementation plan is in `docs/implementation-plan.md`.
 
-The current task is repository setup and planning only. Do not begin application implementation until the user asks to proceed. The brief's request to build the full MVP describes the eventual product, not permission to bypass this planning checkpoint.
+The user has authorized milestone 1: the local tray-to-review workflow. Implement and validate that slice; OAuth, actual uploads, vMix integration, and packaging remain subsequent milestones. See `docs/architecture.md` for the implemented detection and recovery rules.
 
 ## Stack and architecture
 
@@ -38,6 +38,6 @@ The current task is repository setup and planning only. Do not begin application
 - Do not add transcription, editing, n8n, or speculative integrations to the MVP.
 - Do not publish, push, or create external resources unless requested.
 
-## Initial implementation checkpoint
+## Current implementation checkpoint
 
-Start with milestone 1 in `docs/implementation-plan.md` when implementation is authorized. Agree on the queue states and completion/recovery rules before connecting the UI to external services.
+Milestone 1 uses `pyproject.toml` for dependencies and package configuration. Run `.\.venv\Scripts\python.exe -m pytest -q` for the offline suite. Do not enable upload actions until the real uploader and its approval/recovery tests exist.
