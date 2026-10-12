@@ -70,3 +70,5 @@ class Recording:
     updated_at: str
     source: str = "filesystem"
     vmix_state: str = ""
+    current_attempt: str = ""
+    upload_ambiguous: bool = False

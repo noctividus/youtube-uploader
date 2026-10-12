@@ -2,7 +2,7 @@
 
 ## Current checkpoint
 
-The local tray-to-review workflow is implemented. The user subsequently requested vMix recording-state integration ahead of the original order: it is now the default trigger and replaces folder monitoring/stability delays when enabled. See `README.md` for setup and validation and `docs/architecture.md` for state and recovery decisions. YouTube uploads, webhook dispatch, packaging, and broader operational validation remain planned.
+The local review workflow, vMix integration, approved YouTube uploads, and authenticated webhook dispatch are implemented. vMix is the default trigger and replaces folder monitoring/stability delays when enabled. Settings includes desktop OAuth channel connection; uploads run one at a time with persisted outcomes and conservative interruption recovery. Webhook delivery uses a durable outbox with bounded retries and encrypted authentication headers. Live Google/receiver acceptance testing, packaging, and broader operational validation remain. See `README.md` for setup and validation and `docs/architecture.md` for state and recovery decisions.
 
 ## First step: a durable local recording-review workflow
 

@@ -68,6 +68,8 @@ class Controller(QObject):
         self.pending: set[int] = set()
         self.vmix_pending: set[int] = set()
         self.vmix_status_text = "Waiting for vMix"
+        self.youtube_state = {}
+        self.webhook_status_text = ""
         self.presented: set[int] = set()
         self.review_window = None
         self.settings_window = None
@@ -106,6 +108,10 @@ class Controller(QObject):
         self.worker.error.connect(self.show_error)
         self.worker.status.connect(self.status_changed)
         self.worker.reviewed.connect(self.review_saved)
+        self.worker.youtube_state.connect(self.youtube_state_changed)
+        self.worker.upload_progress.connect(self.upload_progress_changed)
+        self.worker.upload_outcome.connect(self.upload_finished)
+        self.worker.webhook_status.connect(self.webhook_status_changed)
         self.timer = QTimer(self)
         self.timer.setInterval(2000)
         self.timer.timeout.connect(self.present_next)
@@ -181,10 +187,39 @@ class Controller(QObject):
             self.settings_window.activateWindow()
             return
         self.settings_window = SettingsWindow(self.settings)
+        self.settings_window.webhook_status.setText(self.webhook_status_text)
+        self.settings_window.set_youtube_state(self.youtube_state)
+        self.settings_window.youtube_requested.connect(lambda payload: self.worker.submit("youtube", payload))
         self.settings_window.vmix_connection.setText(self.vmix_status_text)
         self.settings_window.vmix_test_requested.connect(lambda url: self.worker.submit("vmix_test", url))
         self.settings_window.saved.connect(lambda settings: self.worker.submit("settings", settings))
         self.settings_window.show()
+
+    @Slot(str)
+    def webhook_status_changed(self, message):
+        self.webhook_status_text = message
+        if self.settings_window:
+            self.settings_window.webhook_status.setText(message)
+
+    @Slot(object)
+    def youtube_state_changed(self, state):
+        self.youtube_state = state
+        if self.settings_window:
+            self.settings_window.set_youtube_state(state)
+        if self.review_window:
+            self.review_window.set_youtube_state(state)
+
+    @Slot(object)
+    def upload_progress_changed(self, data):
+        eta = f"{data['eta'] / 60:.1f} min remaining" if data.get("eta") is not None else "Estimating time"
+        self.queue_window.transfer.setText(f"Uploading: {data['bytes'] / 1048576:.1f} MiB · {data['rate'] / 1048576:.1f} MiB/s · {eta}")
+
+    @Slot(object)
+    def upload_finished(self, data):
+        message = data.get("error") or data.get("warning") or f"Uploaded: {data['url']}"
+        self.queue_window.transfer.setText(message)
+        if self.settings.notifications:
+            self.tray.showMessage("YouTube upload", message)
 
     @Slot(str)
     def show_error(self, message: str) -> None:
@@ -238,6 +273,8 @@ class Controller(QObject):
         self.pending.discard(record_id)
         self.vmix_pending.discard(record_id)
         self.review_window = ReviewWindow(record)
+        self.review_window.set_youtube_state(self.youtube_state)
+        self.review_window.upload_requested.connect(lambda payload: self.worker.submit("upload", payload))
         self.review_window.action_requested.connect(lambda payload: self.worker.submit("review", payload))
         self.review_window.show()
         if not automatic:

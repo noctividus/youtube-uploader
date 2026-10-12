@@ -16,6 +16,8 @@ from .database import Database
 from .files import revalidate
 from .monitor import Monitor
 from .vmix import VmixClient, VmixMonitor
+from .youtube_service import YouTubeService
+from .webhooks import Webhooks
 
 log = logging.getLogger(__name__)
 
@@ -39,6 +41,10 @@ class Worker(QThread):
     vmix_status = Signal(str)
     vmix_test_result = Signal(str)
     recording_stopped = Signal(int)
+    youtube_state = Signal(object)
+    upload_progress = Signal(object)
+    upload_outcome = Signal(object)
+    webhook_status = Signal(str)
 
     def __init__(self, data_dir: Path):
         super().__init__()
@@ -51,6 +57,47 @@ class Worker(QThread):
         self.watched: set[str] = set()
         self.paused = False
         self.previous_errors: list[str] = []
+        self.youtube_account = {}
+        self.youtube_busy = False
+        self.webhooks = None
+        self.settings = Settings()
+        self.vmix_failed = False
+        self.vmix_announced = set()
+        self.filesystem_announced = set()
+
+    def _webhook(self, event, record=None, **details):
+        if not self.webhooks or not self.settings.webhooks:
+            return
+        data = dict(details)
+        if record:
+            data["recording"] = {"id": record.id, "filename": Path(record.path).name,
+                                 "size": record.size, "title": record.title, "source": record.source}
+        try:
+            self.webhooks.enqueue(self.settings.webhooks, event, data)
+        except Exception:
+            # Delivery errors must never recursively generate Error webhooks.
+            self.webhook_status.emit("Could not save webhook delivery. Check local storage and header settings.")
+
+    def _youtube_event(self, database, kind, data):
+        if kind == "operation_error":
+            self._webhook("error", **data)
+        elif kind == "account":
+            self.youtube_account = data
+            self.youtube_busy = data.get("busy", False)
+            self.youtube_state.emit(data)
+        else:
+            database.upload_event(kind, data)
+            if kind == "progress":
+                self.upload_progress.emit(data)
+            elif kind in {"done", "failed"}:
+                self.upload_outcome.emit(data)
+            if kind == "created":
+                self._webhook("upload_finished", database.get(data["recording_id"]),
+                              attempt_id=data["attempt_id"], youtube_id=data["video_id"], youtube_url=data["url"])
+            elif kind == "failed":
+                self._webhook("error", database.get(data["recording_id"]),
+                              operation="upload", attempt_id=data["attempt_id"], message=data["error"],
+                              ambiguous=data["ambiguous"])
 
     def submit(self, command: str, payload: object = None) -> None:
         self.commands.put((command, payload))
@@ -100,15 +147,25 @@ class Worker(QThread):
     def run(self) -> None:
         database = None
         client = None
+        youtube = None
         try:
             self.data_dir.mkdir(parents=True, exist_ok=True)
             database = Database(self.data_dir / "queue.sqlite3")
             database.recover()
+            youtube = YouTubeService(self.data_dir, lambda kind, data: self.submit("youtube_event", (kind, data)))
+            youtube.start()
             try:
                 settings = load_settings(self.data_dir / "settings.json")
             except (OSError, ValueError) as exc:
                 self.error.emit(str(exc) + " Defaults are in use; the existing file is preserved until Save.")
                 settings = Settings()
+            self.settings = settings
+            try:
+                self.webhooks = Webhooks(self.data_dir / "webhooks.sqlite3", self.webhook_status.emit)
+                self.webhooks.start()
+            except Exception:
+                self.webhooks = None
+                self.webhook_status.emit("Webhook outbox unavailable. Check local storage and restart to retry.")
             self.settings_changed.emit(settings)
             monitor = Monitor(database, settings)
             vmix = VmixMonitor(database, settings)
@@ -124,7 +181,31 @@ class Worker(QThread):
                 while not self.commands.empty() and not self.stopping.is_set():
                     command, payload = self.commands.get_nowait()
                     try:
-                        if command == "settings":
+                        if command == "youtube_event":
+                            self._youtube_event(database, *payload)
+                        elif command == "youtube":
+                            if self.youtube_busy:
+                                raise ValueError("Wait for the current YouTube operation to finish.")
+                            self.youtube_busy = True
+                            youtube.submit(*payload)
+                        elif command == "upload":
+                            if self.youtube_busy:
+                                raise ValueError("Wait for the current YouTube operation to finish.")
+                            record_id, version, title, description, privacy, channel_id, playlist_id, acknowledge = payload
+                            if not self.youtube_account.get("connected") or channel_id != self.youtube_account.get("channel_id"):
+                                raise ValueError("Connect the intended YouTube channel in Settings, then review again.")
+                            record = database.get(record_id)
+                            if not revalidate(record.path, version[:3], version[3]):
+                                raise ValueError("The file changed or is busy. Close this window and review again.")
+                            job = database.approve_upload(record_id, version, title, description, privacy,
+                                                          channel_id, playlist_id, acknowledge)
+                            database.upload_event("started", {"attempt_id": job.attempt_id})
+                            self.youtube_busy = True
+                            youtube.submit("upload", job)
+                            self._webhook("upload_started", database.get(record.id), attempt_id=job.attempt_id,
+                                          channel_id=job.channel_id, privacy=job.privacy)
+                            self.reviewed.emit(record_id)
+                        elif command == "settings":
                             payload.validate()
                             save_settings(self.data_dir / "settings.json", payload)
                             if (settings.vmix_enabled, settings.vmix_url) != (payload.vmix_enabled, payload.vmix_url):
@@ -133,6 +214,7 @@ class Worker(QThread):
                             vmix.settings = payload
                             next_poll = 0.0
                             settings = payload
+                            self.settings = settings
                             monitor.configure(settings)
                             self._watch(settings)
                             self.settings_changed.emit(settings)
@@ -144,7 +226,7 @@ class Worker(QThread):
                             if not self.paused:
                                 self.dirty.set()
                                 if not settings.vmix_enabled:
-                                    database.recover()
+                                    database.recover(uploads=False)
                         elif command == "vmix_test":
                             try:
                                 state = client.fetch(payload)
@@ -171,6 +253,7 @@ class Worker(QThread):
                     except Exception as exc:
                         log.exception("Command failed: %s", command)
                         self.error.emit(str(exc))
+                        self._webhook("error", operation=command, message="Application operation failed; check the app.")
                 clock = time.monotonic()
                 # A long scheduling gap (e.g. sleep) is not observed stability.
                 if clock - last_tick > max(10, settings.vmix_poll_seconds * 2):
@@ -179,7 +262,7 @@ class Worker(QThread):
                         vmix.disconnect()
                         next_poll = 0.0
                     else:
-                        database.recover()
+                        database.recover(uploads=False)
                     self.dirty.set()
                 last_tick = clock
                 if not self.paused:
@@ -187,16 +270,27 @@ class Worker(QThread):
                         if clock >= next_poll:
                             try:
                                 state = client.fetch(settings.vmix_url)
+                                was_recording = bool(vmix.previous and vmix.previous.recording)
                                 stopped_ids = vmix.update(state)
+                                if state.recording and not was_recording and vmix.current_id not in self.vmix_announced:
+                                    self._webhook("recording_started", database.get(vmix.current_id),
+                                                  observed=True)
+                                    self.vmix_announced.add(vmix.current_id)
+                                self.vmix_failed = False
                                 vmix.check_completed()
                                 for record_id in stopped_ids:
                                     self.recording_stopped.emit(record_id)
+                                    self._webhook("recording_finished", database.get(record_id))
+                                    self.vmix_announced.discard(record_id)
                                 streaming = 'unknown' if state.streaming is None else 'yes' if state.streaming else 'no'
                                 vmix_connection = f"Connected — {vmix.message}; Streaming: {streaming}"
                             except (requests.RequestException, ValueError) as exc:
                                 vmix.disconnect()
                                 detail = str(exc) if isinstance(exc, ValueError) else type(exc).__name__
                                 vmix_connection = f"Disconnected — {detail}; retrying"
+                                if not self.vmix_failed:
+                                    self._webhook("error", operation="vmix", message="vMix connection failed; retrying.")
+                                self.vmix_failed = True
                             next_poll = time.monotonic() + settings.vmix_poll_seconds
                         self.vmix_status.emit(vmix_connection)
                         self.status.emit(f"vMix: {vmix_connection}")
@@ -215,8 +309,20 @@ class Worker(QThread):
             log.exception("Monitor failed")
             self.error.emit(f"Monitoring stopped: {exc}. Exit and restart after correcting the problem.")
             self.status.emit("Error: monitoring stopped")
+            self._webhook("error", operation="monitor", message="Monitoring stopped; check the app.")
         finally:
+            if youtube:
+                youtube.stopping.set()
+                youtube.join()
+                # Persist final success/failure even when Exit was requested mid-upload.
+                while not self.commands.empty():
+                    command, payload = self.commands.get_nowait()
+                    if command == "youtube_event" and database:
+                        self._youtube_event(database, *payload)
             self._stop_observer()
+            if self.webhooks:
+                self.webhooks.stop()
+                self.webhooks.join()
             if client:
                 client.close()
             if database:
@@ -232,12 +338,19 @@ class Worker(QThread):
             last_scan = clock
             self._ensure_watches(settings)
         ready_ids = monitor.tick(clock, scan, self.stopping.is_set)
+        for record_id in monitor.auto_review_ids - self.filesystem_announced:
+            self._webhook("recording_started", database.get(record_id), evidence="new_file_observed")
+            self.filesystem_announced.add(record_id)
         for record_id in ready_ids:
             if record_id in monitor.auto_review_ids and not database.get(record_id).deferred:
                 self.ready.emit(record_id)
+                self._webhook("recording_finished", database.get(record_id), evidence="file_stability")
             monitor.auto_review_ids.discard(record_id)
+            self.filesystem_announced.discard(record_id)
         self.status.emit("Error: folder unavailable" if monitor.errors else "Idle")
         if monitor.errors != self.previous_errors:
+            if monitor.errors:
+                self._webhook("error", operation="filesystem", message="A watched folder is unavailable.")
             self.error.emit("\n".join(monitor.errors))
             self.previous_errors = monitor.errors.copy()
         return last_scan

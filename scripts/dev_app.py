@@ -29,7 +29,7 @@ def main() -> int:
             return 0
         request.write_text("stop", encoding="utf-8")
         print("Waiting for the testing app to close its watcher and database…", flush=True)
-        deadline = time.monotonic() + 20
+        deadline = time.monotonic() + 60
         while time.monotonic() < deadline:
             if lock.tryLock(0):
                 lock.unlock()

@@ -4,7 +4,7 @@
 
 `models.py`, `database.py`, `files.py`, `monitor.py`, and `vmix.py` contain domain logic without Qt dependencies. A single `Worker` QThread owns the SQLite connection, vMix HTTP polling, filesystem checks, configuration writes, and watchdog lifecycle. UI commands enter a thread-safe queue; immutable recording snapshots return through Qt signals. Watchdog callbacks only mark discovery dirty. vMix requests use bounded connect/read timeouts and run off the GUI thread.
 
-The database uses WAL, FULL synchronous writes, transactions, schema constraints, and `PRAGMA user_version` migrations. Version 1 includes fields for the intended upload lifecycle; version 2 adds recording source and vMix lifecycle state without dropping history. Unknown newer schema versions fail visibly rather than rewriting data. Application settings use an fsynced temporary JSON file followed by atomic replacement. Neither source videos nor user credentials are stored in the repository.
+The database uses WAL, FULL synchronous writes, transactions, schema constraints, and `PRAGMA user_version` migrations. Version 1 includes fields for the intended upload lifecycle; version 2 adds recording source and vMix lifecycle state; version 3 adds upload-attempt history and duplicate-risk tracking. Unknown newer schema versions fail visibly rather than rewriting data. Application settings use an fsynced temporary JSON file followed by atomic replacement. Neither source videos nor user credentials are stored in the repository.
 
 Exit stops accepting interaction, signals the worker, and keeps the UI event loop responsive while watchdog shuts down and SQLite closes. There is no forced worker termination. OS calls to inaccessible network storage can still delay shutdown; production validation should use the intended recording disks.
 
@@ -18,7 +18,7 @@ The Windows key combines volume/device ID, file ID, and file birth timestamp. Si
 
 Readiness requires a continuously observed, nonempty, unchanged size/timestamp for the configured stability interval, then a `CreateFileW` read handle with sharing disabled. A busy file restarts the interval. A bounded SHA-256 sample of the beginning, middle, and end (at most 192 KiB) is saved at completion; the file is statted again after sampling. This fingerprint is additional evidence, not a full-content checksum. Filesystems or writers that preserve all metadata and modify only unsampled regions cannot be distinguished reliably by this scheme.
 
-Reviews include the identity, size, timestamp, and sampled fingerprint that the user saw. Before saving Later/Skip, the worker checks them against the live file and current database record. A stale review cannot be applied silently to a changed recording. The future uploader must run the same preflight and add upload-specific checks; readiness alone never authorizes uploading.
+Reviews include the identity, size, timestamp, and sampled fingerprint that the user saw. Before saving Later/Skip or approving an upload, the worker checks them against the live file and current database record. A stale review cannot be applied silently to a changed recording. The uploader repeats this preflight, then holds a Windows read handle that denies writes and deletion throughout transfer; readiness alone never authorizes uploading.
 
 Scans are non-recursive. Known queue entries continue to be checked after removal of their watch folder, but new files there are not discovered. Directory errors are isolated. Missing files lose readiness and stay visible as unavailable; restoration starts a new stability interval. Duplicate filesystem events do not create duplicate database rows. Stable file identities let renames preserve suppression.
 
@@ -39,14 +39,26 @@ Readiness and automatic review eligibility are separate. The first successful sc
 | Interrupted Approved/Uploading state | Failed, with approval cleared and a review-required error |
 | Unchanged Uploaded/Skipped state | Remains Uploaded/Skipped |
 
-The current schema tracks the latest observed version of each file identity. Before milestone 2 enables uploads, add immutable upload-attempt history so overwriting a previously uploaded source preserves its earlier YouTube result independently of the current file version. The current workflow cannot create uploads and does not claim upload-session recovery.
+The queue tracks the latest observed version of each file identity. Every approved upload also creates a separate attempt with frozen source identity, path, fingerprint, metadata, channel ID and playlist ID. Progress/outcomes update that attempt; file replacement never deletes earlier results. Only the current attempt may update its queue row. Startup converts pending/in-flight operations to Failed without restarting them; an in-flight attempt additionally requires explicit duplicate-risk acknowledgment. Routine monitoring pause/resume does not recover or disrupt live uploads.
 
 The worker resets readiness observation after a long scheduling gap (over five seconds) and on resume from Pause. OS suspend behavior and focus handling still require interactive validation. The controller checks Windows desktop availability before presenting pending reviews, keeps one review window open at a time, and never calls activation methods for automatic reviews. A user-requested review may activate normally. Closing a review without a button dismisses it for the current session; use Later to persist deferral across restarts.
 
 ## Future integrations
 
-The vMix integration has been implemented ahead of the original milestone order at the user's request. It uses read-only HTTP XML polling (default two seconds); vMix control functions and automatic path mapping are not implemented. Primary recordings without an absolute filename remain explicit unresolved queue entries. Secondary recorder/MultiCorder support and webhook dispatch are future work.
+The vMix integration uses read-only HTTP XML polling (default two seconds); vMix control functions and automatic path mapping are not implemented. Primary recordings without an absolute filename remain explicit unresolved queue entries. Secondary recorder/MultiCorder support remains future work.
 
-OAuth, approval-to-upload transitions, resumable sessions, retries, durable upload-attempt history, Google API errors, and actual progress are milestone 2 work. The reserved statuses/columns are not substitutes for those implementations.
+## Webhook delivery
+
+The monitoring worker snapshots selected endpoints into a separate durable SQLite outbox when an event occurs. A dedicated HTTP thread delivers JSON without blocking monitoring or uploads. Endpoint configuration is retained per event, headers use current-user Windows DPAPI encryption, and retries preserve the event ID. The outbox is independent of queue database migrations. Events and the recording database changes are not one atomic transaction; a process crash between them can omit an event. Once queued, delivery is at least once with a three-attempt limit, not exactly once. Receivers must deduplicate IDs. Shutdown stops after the current bounded request and leaves pending events for restart.
+
+HTTP redirects, response-body consumption, ambient netrc authentication and environment proxies are disabled. Errors report only delivery ID, HTTP code and attempt count. Event emission is explicit at lifecycle transitions; delivery failures never generate new Error events. Header editing follows Settings Save/Cancel semantics. See README for payloads, event meanings and retention rules.
+
+## YouTube connection and transfer
+
+`youtube_service.py` runs OAuth and uploads on a dedicated serial Python thread, separate from vMix polling. It returns events through the worker's command queue; only the Qt worker writes SQLite. Account changes are blocked during a transfer. The UI never handles credentials. Desktop OAuth uses a random loopback port, state verification and PKCE with a three-minute sign-in timeout. The explicit Windows keyring backend stores the imported client and refresh credentials, without a plaintext fallback. Google API errors are sanitized before reaching UI/logs.
+
+`youtube.py` checks the currently authorized channel against the approved channel ID before insertion. Uploads use 8 MiB resumable chunks, bounded retries within one known session, and progress/speed/ETA events. Google transport failures are retried against the same session, including a status query after a lost response. The app does not persist resumable URLs or automatically initiate a second insert. A restart or ambiguous failure requires the user to check YouTube Studio before explicitly retrying.
+
+The video ID and URL are persisted as soon as creation succeeds, before optional playlist placement. Playlist failure is a warning on the successful upload. Exit cancels OAuth or stops transfer between bounded network operations, joins the network thread, drains final result events, then closes SQLite. Upload history is retained in `upload_attempts`; the queue shows the current version's result. A separate history browser is not implemented.
 
 Implementation references: [Qt QLockFile](https://doc.qt.io/qtforpython-6/PySide6/QtCore/QLockFile.html) for per-data-directory process locking, and the [watchdog quickstart](https://python-watchdog.readthedocs.io/en/stable/quickstart.html) for observer startup/shutdown.
