@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 from PySide6.QtCore import QLockFile, QObject, QStandardPaths, QTimer, QUrl, Slot
-from PySide6.QtGui import QColor, QDesktopServices, QIcon, QPainter, QPixmap
+from PySide6.QtGui import QDesktopServices, QIcon
 from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QSystemTrayIcon
 
 from .config import Settings
@@ -40,21 +40,7 @@ def desktop_available() -> bool:
 
 
 def tray_icon() -> QIcon:
-    pixmap = QPixmap(64, 64)
-    pixmap.fill(QColor("transparent"))
-    painter = QPainter(pixmap)
-    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-    painter.setPen(QColor("#df3038"))
-    painter.setBrush(QColor("#df3038"))
-    painter.drawRoundedRect(3, 10, 58, 44, 10, 10)
-    painter.setPen(QColor("white"))
-    font = painter.font()
-    font.setPixelSize(34)
-    font.setBold(True)
-    painter.setFont(font)
-    painter.drawText(18, 44, "↑")
-    painter.end()
-    return QIcon(pixmap)
+    return QIcon(str(Path(__file__).resolve().parent / "assets" / "app.ico"))
 
 
 class Controller(QObject):
@@ -82,10 +68,11 @@ class Controller(QObject):
         self.queue_window.scan_requested.connect(lambda: self.worker.submit("scan"))
         self.tray = QSystemTrayIcon(tray_icon(), self)
         self.menu = QMenu()
-        self.status_action = self.menu.addAction("Starting…")
-        self.status_action.setEnabled(False)
-        self.menu.addSeparator()
-        self.menu.addAction("Open Upload Queue", self.show_queue)
+        open_queue = self.menu.addAction("Open Upload Queue", self.show_queue)
+        font = open_queue.font()
+        font.setBold(True)
+        open_queue.setFont(font)
+        self.menu.setDefaultAction(open_queue)
         self.settings_action = self.menu.addAction("Settings", self.show_settings)
         self.settings_action.setEnabled(False)
         self.pause_action = self.menu.addAction("Pause Monitoring")
@@ -121,7 +108,6 @@ class Controller(QObject):
 
     @Slot(str)
     def status_changed(self, status: str) -> None:
-        self.status_action.setText(status)
         self.queue_window.summary.setText(f"{status} · {len(self.records)} recordings")
 
     @Slot(int)
@@ -150,7 +136,7 @@ class Controller(QObject):
         self.worker.submit("pause", paused)
 
     def activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
-        if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
+        if reason in {QSystemTrayIcon.ActivationReason.Trigger, QSystemTrayIcon.ActivationReason.DoubleClick}:
             self.show_queue()
 
     def show_queue(self) -> None:
@@ -311,12 +297,26 @@ class Controller(QObject):
 
 
 def main() -> int:
+    if os.name == "nt" and getattr(sys, "frozen", False):
+        from ctypes import wintypes
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+        kernel.CreateMutexW.restype = wintypes.HANDLE
+        # A lifetime marker for Setup/Uninstall; per-data-directory QLockFile
+        # below remains the app's single-instance guard. Windows closes this
+        # handle at process exit, after all threads/resources have shut down.
+        if not kernel.CreateMutexW(None, False, "vMixYouTubeUploader.Running"):
+            raise ctypes.WinError(ctypes.get_last_error())
+        shell = ctypes.WinDLL("shell32")
+        shell.SetCurrentProcessExplicitAppUserModelID.argtypes = [wintypes.LPCWSTR]
+        shell.SetCurrentProcessExplicitAppUserModelID("vMix.YouTubeUploader")
     parser = argparse.ArgumentParser(description="vMix YouTube Uploader local recording review")
     parser.add_argument("--data-dir", type=Path, help="Override per-user state directory (for isolated testing)")
     args = parser.parse_args()
     app = QApplication(sys.argv[:1])
     app.setApplicationName("vMix YouTube Uploader")
     app.setOrganizationName("vMix YouTube Uploader")
+    app.setWindowIcon(tray_icon())
     app.setQuitOnLastWindowClosed(False)
     data_dir = args.data_dir or Path(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppLocalDataLocation))
     data_dir = data_dir.absolute()

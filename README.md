@@ -1,6 +1,14 @@
 # vMix YouTube Uploader
 
-A Windows system-tray application that listens to vMix recording state, queues completed recordings for review, uploads approved videos to YouTube, and sends authenticated webhook notifications. Windows startup registration and standalone packaging remain future work.
+A Windows system-tray application that listens to vMix recording state, queues completed recordings for review, uploads approved videos to YouTube, and sends authenticated webhook notifications. Local Windows builds produce an installer and portable ZIP; no GitHub Actions build is required.
+
+## Install a release
+
+Download the Windows x64 **setup EXE** from this repository's GitHub **Releases** page and run it. Python is included. The installer offers Start Menu/desktop shortcuts and optional startup at Windows sign-in, installs for the current user without requiring administrator rights, and provides an entry in Windows Installed Apps for uninstalling. The app launches into the system tray; click its icon to open the upload queue.
+
+Alternatively, extract the **entire portable ZIP** and run `vMixYouTubeUploader.exe` inside its folder. Keep `_internal` beside the EXE. Portable describes installation only: settings and credentials still use your Windows user profile, and portable/installed copies share the same normal application data directory.
+
+Connect your channel with your own Desktop OAuth JSON under **Settings → YouTube**, configure vMix, and enter your webhook headers on that machine. No developer credentials, settings, recordings, or upload history are included. Releases are currently unsigned; Windows may show an unknown-publisher warning. Close the app using its tray **Exit** before upgrading or uninstalling. Settings, history, logs, and account credentials are retained on uninstall; use YouTube **Disconnect** first if you want to remove the local account token.
 
 ## Run on Windows
 
@@ -25,6 +33,56 @@ In VS Code, open the Command Palette (**Ctrl+Shift+P**), select **Tasks: Run Tas
 - **Uploader: Restart testing app** to run Stop followed by Run for quick testing iterations. It also starts the app if it is already stopped.
 
 These tasks use the repository's `.venv` and retain separate test settings/history under `%LOCALAPPDATA%\vMix YouTube Uploader\Development\<workspace-id>`. Configure the vMix endpoint on your first test run. The stop task only targets this workspace's testing instance; a normally launched instance is separate. Use the stop task instead of the terminal's trash/terminate button.
+
+## Build a Windows release locally
+
+Use Windows x64 and an x64 Python installation (the release build is validated with Python 3.14.5). The build also requires a signed-in Windows desktop session for its tray smoke check.
+
+One-time setup on a new build machine:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements-build.lock
+.\.venv\Scripts\python.exe -m pip install --no-deps -e .
+```
+
+Install the [Inno Setup compiler](https://jrsoftware.org/isdl.php) locally. The build finds `ISCC.exe` on PATH, in standard Inno Setup 6/7 locations, or in `.tools\inno`. For a custom location, set `ISCC_PATH` or pass `-ISCCPath` to the PowerShell script. The development workspace already has Inno Setup 6.7.3 under `.tools\inno`; it is not committed or included in releases.
+
+Run **Tasks: Run Build Task** (**Ctrl+Shift+B**) → **Uploader: Build Windows release**, or:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build.ps1
+```
+
+The task verifies pinned dependencies, runs the offline tests, regenerates icons, builds the standalone application with PyInstaller, and runs that executable's isolated offline self-check. The check covers tray/worker startup, SQLite, the bundled icon and YouTube discovery document, OAuth imports, Windows Credential Manager, and encrypted webhook settings. It does not connect to Google, call webhooks, or upload recordings. Finally, Inno Setup creates the installer and the build creates a portable ZIP and SHA-256 checksums.
+
+Output for the version in `pyproject.toml`:
+
+```text
+releases/0.1.0/
+  vMixYouTubeUploader-0.1.0-windows-x64-setup.exe
+  vMixYouTubeUploader-0.1.0-windows-x64-portable.zip
+  SHA256SUMS.txt
+  RELEASE-NOTES.md
+```
+
+`build/` and `dist/` contain intermediate files. These directories, `releases/`, and `.tools/` are ignored by Git. Rebuilding a version replaces that version's local artifacts. Increase the three-part numeric version in `pyproject.toml` before preparing a new public release. Dependency upgrades require updating and validating `requirements-build.lock`; normal builds do not install or download dependencies. License texts and dependency versions are bundled with the application.
+
+## Publish from VS Code
+
+One-time setup: open **Terminal ? Run Task** and run **Uploader: Install GitHub CLI**, then **Uploader: Sign in to GitHub**. Sign in with an account that can push to this repository and create releases. Installation uses Windows Package Manager; if it is unavailable, install [GitHub CLI](https://cli.github.com/) manually. Restart VS Code if needed after installation.
+
+For each release:
+
+1. Set the three-part version in `pyproject.toml` (currently `0.1.0`; use a new version for each release).
+2. Commit the source changes using VS Code Source Control. The task refuses uncommitted or untracked files and never creates commits for you.
+3. Run **Uploader: Build and publish GitHub release** from **Terminal ? Run Task**.
+
+That task checks GitHub authentication and version availability, runs the complete local build and tests, verifies checksums and that the source stayed unchanged, pushes the current committed branch to `origin`, and creates `v<version>` at that exact commit. It uploads the setup EXE, portable ZIP, and SHA256SUMS.txt with the generated RELEASE-NOTES.md description, verifies the uploaded filenames/sizes, then publishes. The terminal prints the release URL. Running this task authorizes publication; it does not stop at a draft or ask again. Builds run only on your PC.
+
+A failed build never pushes or publishes. A failed upload can leave a draft on GitHub; inspect its assets and finish it using the Releases page before retrying. Existing tags/releases are never replaced. If a push is rejected, sync your branch through Source Control and rerun. The task requires a branch checkout, not detached HEAD. Avoid editing files or running another build while publishing.
+
+**Uploader: Build Windows release** (Ctrl+Shift+B) remains local-only. Use it first for clean-machine installation and private YouTube upload testing; the offline self-check does not cover those live checks. You can also attach its files manually on GitHub's Releases page. See the [GitHub CLI release documentation](https://cli.github.com/manual/gh_release_create).
 
 The same controls work from PowerShell:
 

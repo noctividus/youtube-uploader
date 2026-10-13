@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <title>YouTube Uploader</title>
+  <desc>Red rounded play button with a green upward upload arrow over its upper right corner.</desc>
+  <rect x="12" y="76" width="232" height="164" rx="42" fill="#ff0033"/>
+  <path d="M88 112 L88 204 L162 158 Z" fill="#fff"/>
+  <path d="M192 12 L142 68 H170 V130 H214 V68 H242 Z"
+        fill="#22c55e" stroke="#fff" stroke-width="10" stroke-linejoin="round"/>
+</svg>
