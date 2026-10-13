@@ -4,7 +4,7 @@
 
 Build a reliable Windows system-tray application for reviewing and uploading completed recordings to YouTube. The full requirements are in `docs/project-brief.md`; the staged implementation plan is in `docs/implementation-plan.md`.
 
-The user has authorized the local review workflow, vMix integration, YouTube connection/uploads, and authenticated webhook delivery. vMix mode supersedes folder watching and stability timers by default. Desktop OAuth, explicitly approved uploads, and a durable webhook outbox are implemented. Packaging remains subsequent work. See `docs/architecture.md` for detection and recovery rules.
+The user has authorized the local review workflow, vMix integration, YouTube connection/uploads, authenticated webhook delivery, and local Windows packaging. vMix mode supersedes folder watching and stability timers by default. Desktop OAuth, explicitly approved uploads, and a durable webhook outbox are implemented. The local release task uses PyInstaller and Inno Setup; GitHub hosts locally built release assets uploaded manually or by the explicit publish task and must not run builds. See `docs/architecture.md` for detection and recovery rules.
 
 ## Stack and architecture
 
@@ -41,3 +41,5 @@ The user has authorized the local review workflow, vMix integration, YouTube con
 ## Current implementation checkpoint
 
 Dependencies and package configuration live in `pyproject.toml`. Run `.\.venv\Scripts\python.exe -m pytest -q` for the offline suite. Live Google authorization and real video uploads require interactive validation by the user; automated tests must never upload to a real channel.
+
+Use `scripts/build.ps1` or the VS Code **Uploader: Build Windows release** task for release artifacts in ignored `releases/<version>/`. Maintain `requirements-build.lock` when intentionally upgrading dependencies. The frozen self-check needs a normal Windows desktop/logon session to validate Credential Manager; a sandbox can deny this access. Never bundle local state or credentials. The explicit **Uploader: Build and publish GitHub release** task may push committed source, create a version tag, and publish assets when the user runs it. The build-only task must never publish or tag; do not invoke publication during automated validation.

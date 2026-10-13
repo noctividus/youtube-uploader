@@ -16,12 +16,16 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8,<10"]
+build = ["pyinstaller==6.22.3", "pyinstaller-hooks-contrib==2026.8"]
 
 [project.gui-scripts]
 vmix-youtube-uploader = "vmix_youtube_uploader.main:main"
 
 [tool.setuptools.packages.find]
 include = ["vmix_youtube_uploader*"]
+
+[tool.setuptools.package-data]
+vmix_youtube_uploader = ["assets/*.svg", "assets/*.png", "assets/*.ico"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -2,7 +2,7 @@
 
 ## Current checkpoint
 
-The local review workflow, vMix integration, approved YouTube uploads, and authenticated webhook dispatch are implemented. vMix is the default trigger and replaces folder monitoring/stability delays when enabled. Settings includes desktop OAuth channel connection; uploads run one at a time with persisted outcomes and conservative interruption recovery. Webhook delivery uses a durable outbox with bounded retries and encrypted authentication headers. Live Google/receiver acceptance testing, packaging, and broader operational validation remain. See `README.md` for setup and validation and `docs/architecture.md` for state and recovery decisions.
+The local review workflow, vMix integration, approved YouTube uploads, authenticated webhooks, and local Windows packaging are implemented. vMix is the default trigger. Uploads retain conservative interruption recovery; webhooks use a durable outbox with encrypted headers. The local build task produces an installer and portable ZIP for manual GitHub Release upload or the explicit VS Code build-and-publish task. Live Google/receiver acceptance testing, clean-machine release validation, and broader operational validation remain. See `README.md` for setup and validation and `docs/architecture.md` for state and recovery decisions.
 
 ## First step: a durable local recording-review workflow
 
