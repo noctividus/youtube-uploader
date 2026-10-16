@@ -59,9 +59,9 @@ The task verifies pinned dependencies, runs the offline tests, regenerates icons
 Output for the version in `pyproject.toml`:
 
 ```text
-releases/0.1.0/
-  vMixYouTubeUploader-0.1.0-windows-x64-setup.exe
-  vMixYouTubeUploader-0.1.0-windows-x64-portable.zip
+releases/0.2.0/
+  vMixYouTubeUploader-0.2.0-windows-x64-setup.exe
+  vMixYouTubeUploader-0.2.0-windows-x64-portable.zip
   SHA256SUMS.txt
   RELEASE-NOTES.md
 ```
@@ -74,7 +74,7 @@ One-time setup: open **Terminal ? Run Task** and run **Uploader: Install GitHub 
 
 For each release:
 
-1. Set the three-part version in `pyproject.toml` (currently `0.1.0`; use a new version for each release).
+1. Set the three-part version in `pyproject.toml` (currently `0.2.0`; use a new version for each release).
 2. Commit the source changes using VS Code Source Control. The task refuses uncommitted or untracked files and never creates commits for you.
 3. Run **Uploader: Build and publish GitHub release** from **Terminal ? Run Task**.
 
