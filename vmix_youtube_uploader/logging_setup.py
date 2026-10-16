@@ -15,6 +15,9 @@ class JsonFormatter(logging.Formatter):
 
 
 def configure_logging(directory: Path) -> None:
+    # This library logs raw 403 response bodies/reasons, which can contain URLs
+    # or credentials. youtube.UploadTransport emits safe status/type diagnostics.
+    logging.getLogger("googleapiclient.http").disabled = True
     directory.mkdir(parents=True, exist_ok=True)
     handler = RotatingFileHandler(directory / "uploader.log", maxBytes=2_000_000,
                                   backupCount=5, encoding="utf-8")

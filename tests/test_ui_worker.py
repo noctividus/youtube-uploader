@@ -74,7 +74,7 @@ def test_queue_shortcuts_sorting_and_selected_review(app, database, tmp_path):
     window.settings_requested.connect(lambda: settings.append(True))
     try:
         window.update_records(records)
-        assert {button.text() for button in window.findChildren(QPushButton)} == {"Settings", "Upload"}
+        assert {button.text() for button in window.findChildren(QPushButton)} == {"Settings", "Upload", "Add Video"}
         window.show()
         assert scans == [True]
         window.settings_button.click()
@@ -251,3 +251,63 @@ def test_single_instance_lock_blocks_another_process_and_releases(tmp_path):
         lock.unlock()
     result = subprocess.run([sys.executable, "-c", script, path], capture_output=True, text=True, check=True)
     assert result.stdout.strip() == "True"
+
+
+def test_manual_picker_and_upload_percent(app, database, tmp_path, monkeypatch):
+    from vmix_youtube_uploader.ui import QFileDialog
+    path = tmp_path / "manual.mp4"
+    path.write_bytes(b"video")
+    record = database.observe(Snapshot.read(path), "")
+    window = QueueWindow()
+    added = []
+    window.add_video_requested.connect(added.append)
+    try:
+        monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *args: (str(path), ""))
+        window.add_video_button.click()
+        assert added == [str(path)]
+        monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *args: ("", ""))
+        window.add_video_button.click()
+        assert len(added) == 1
+        for status, sent, expected in [(Status.UPLOADING, 0, "0.0%"),
+                                       (Status.UPLOADING, 125, "12.5%"),
+                                       (Status.UPLOADING, 1000, "99.9%"),
+                                       (Status.UPLOADED, 1000, "100.0%")]:
+            window.update_records([replace(record, status=status, size=1000, bytes_uploaded=sent)])
+            window.select_record(record.id)
+            assert window.table.item(0, 5).text() == expected
+            assert window.selected().id == record.id
+    finally:
+        window.deleteLater()
+
+
+@pytest.mark.parametrize("vmix_enabled", [False, True])
+def test_worker_manual_add_without_triggers(app, tmp_path, monkeypatch, vmix_enabled):
+    from vmix_youtube_uploader.vmix import VmixState
+    monkeypatch.setattr("vmix_youtube_uploader.worker.VmixClient.fetch", lambda *_: VmixState(False, False))
+    data = tmp_path / "data"
+    save_settings(data / "settings.json", Settings(vmix_enabled=vmix_enabled, notifications=False,
+                  directories=[], file_extensions=[".mov"], stability_seconds=3600))
+    path = tmp_path / "manual.mp4"
+    path.write_bytes(b"test video")
+    worker = Worker(data)
+    updates, added, automatic, errors = [], [], [], []
+    worker.records_changed.connect(updates.append)
+    worker.manual_added.connect(added.append)
+    worker.ready.connect(automatic.append)
+    worker.error.connect(errors.append)
+    worker.start()
+    try:
+        worker.submit("pause", True)
+        worker.submit("add_video", str(path))
+        wait_for(app, lambda: bool(added) and bool(updates[-1]))
+        record = updates[-1][0]
+        assert record.id == added[0] and record.status == Status.READY
+        assert record.source == "manual" and record.fingerprint
+        assert not record.approved and record.privacy == "private"
+        worker.submit("add_video", str(path))
+        wait_for(app, lambda: len(added) == 2)
+        assert added[0] == added[1] and len(updates[-1]) == 1
+        assert not automatic and not any(errors)
+    finally:
+        worker.stop()
+        assert worker.wait(5000)

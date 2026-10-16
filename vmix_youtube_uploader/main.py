@@ -66,6 +66,8 @@ class Controller(QObject):
         self.queue_window.settings_requested.connect(self.show_settings)
         self.queue_window.settings_button.setEnabled(False)
         self.queue_window.scan_requested.connect(lambda: self.worker.submit("scan"))
+        self.queue_window.add_video_requested.connect(lambda path: self.worker.submit("add_video", path))
+        self.worker.manual_added.connect(self.queue_window.select_record)
         self.tray = QSystemTrayIcon(tray_icon(), self)
         self.menu = QMenu()
         open_queue = self.menu.addAction("Open Upload Queue", self.show_queue)
@@ -198,7 +200,9 @@ class Controller(QObject):
     @Slot(object)
     def upload_progress_changed(self, data):
         eta = f"{data['eta'] / 60:.1f} min remaining" if data.get("eta") is not None else "Estimating time"
-        self.queue_window.transfer.setText(f"Uploading: {data['bytes'] / 1048576:.1f} MiB · {data['rate'] / 1048576:.1f} MiB/s · {eta}")
+        record = self.records.get(data["recording_id"])
+        percent = f"{min(99.9, max(0.0, 100 * data['bytes'] / record.size)):.1f}% · " if record and record.size else ""
+        self.queue_window.transfer.setText(f"Uploading: {percent}{data['bytes'] / 1048576:.1f} MiB · {data['rate'] / 1048576:.1f} MiB/s · {eta}")
 
     @Slot(object)
     def upload_finished(self, data):
@@ -226,6 +230,9 @@ class Controller(QObject):
             return
         for record_id in sorted(self.pending):
             record = self.records.get(record_id)
+            if record and record.source == "manual":
+                self.pending.discard(record_id)
+                continue
             vmix_stopped = record_id in self.vmix_pending and record is not None and record.vmix_state == "stopped"
             if record is None or (not vmix_stopped and (record.status != Status.READY or not record.available)):
                 continue

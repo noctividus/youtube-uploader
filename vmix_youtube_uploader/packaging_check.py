@@ -35,6 +35,8 @@ def run(directory: str) -> int:
         assert flow is not None
         api = youtube_api(Credentials(token="offline-self-test"))
         assert api.videos() is not None
+        assert 308 not in api._http.http.redirect_codes
+        assert {301, 302, 303, 307}.issubset(api._http.http.redirect_codes)
         api.close()  # Building from bundled discovery data makes no network call.
         app = QApplication([])
         app.setApplicationName("vMix YouTube Uploader Packaging Check")

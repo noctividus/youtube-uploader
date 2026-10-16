@@ -2,11 +2,15 @@
 
 import hashlib
 import json
+import logging
 import os
 import secrets
 import threading
 import time
 import webbrowser
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from importlib.metadata import version as package_version
 from contextlib import contextmanager
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -26,6 +30,56 @@ from .files import revalidate, sampled_fingerprint
 from .models import Snapshot
 
 SCOPES = ["https://www.googleapis.com/auth/youtube.force-ssl"]
+LOGGER = logging.getLogger(__name__)
+CHUNK_SIZE = 8 * 1024 * 1024
+MAX_RETRIES = 5
+
+
+def upload_http() -> httplib2.Http:
+    http = httplib2.Http(timeout=120)
+    # Match googleapiclient.http.build_http; supplying our own transport bypasses it.
+    http.redirect_codes = http.redirect_codes - {308}
+    return http
+
+
+class UploadTransport:
+    """Only log allowlisted diagnostics, never headers, bodies, URLs or exception text."""
+
+    def __init__(self, http, attempt_id: str):
+        self.http = http
+        self.attempt_id = attempt_id
+        self.retry_after = 0.0
+
+    def request(self, uri, method="GET", body=None, headers=None, **kwargs):
+        content_range = (headers or {}).get("Content-Range", "")
+        phase = "status" if content_range.startswith("bytes */") else "chunk" if content_range else "init"
+        self.retry_after = 0.0
+        try:
+            response, content = self.http.request(uri, method=method, body=body, headers=headers, **kwargs)
+        except Exception as exc:
+            LOGGER.warning("Upload HTTP exception attempt=%s phase=%s type=%s",
+                           self.attempt_id, phase, type(exc).__name__)
+            raise
+        LOGGER.info("Upload HTTP response attempt=%s phase=%s status=%d", self.attempt_id, phase, response.status)
+        value = response.get("retry-after", "")
+        try:
+            self.retry_after = max(0.0, float(int(value)))
+        except (ValueError, TypeError, OverflowError):
+            try:
+                self.retry_after = max(0.0, (parsedate_to_datetime(value) - datetime.now(timezone.utc)).total_seconds())
+            except (ValueError, TypeError, OverflowError):
+                pass
+        return response, content
+
+
+def probe_upload(request, transport):
+    """Query the existing session without sending media or creating another insert."""
+    response, content = transport.request(request.resumable_uri, method="PUT", headers={
+        "Content-Range": f"bytes */{request.resumable.size()}", "content-length": "0"})
+    # The client's parser handles 200/201 completion, 308 Range (including absent
+    # Range), relocated sessions and error state. Integration tests cover this
+    # private API so dependency updates cannot silently change recovery semantics.
+    return request._process_response(response, content)
 
 
 class UploadFailure(Exception):
@@ -147,7 +201,9 @@ def authorize(config: dict, stopping: threading.Event) -> Credentials:
 
 
 def youtube_api(credentials: Credentials):
-    return build("youtube", "v3", http=AuthorizedHttp(credentials, http=httplib2.Http(timeout=20)),
+    LOGGER.info("YouTube dependencies google-api-python-client=%s google-auth-httplib2=%s httplib2=%s",
+                *(package_version(name) for name in ("google-api-python-client", "google-auth-httplib2", "httplib2")))
+    return build("youtube", "v3", http=AuthorizedHttp(credentials, http=upload_http()),
                  cache_discovery=False, static_discovery=True)
 
 
@@ -228,12 +284,29 @@ def upload_video(api, job: UploadJob, stopping: threading.Event, emit) -> dict:
     if stopping.is_set():
         raise UploadFailure("Upload stopped before sending video data.")
     with protected_video(job) as stream:
-        media = MediaIoBaseUpload(stream, mimetype="application/octet-stream", chunksize=8 * 1024 * 1024, resumable=True)
+        media = MediaIoBaseUpload(stream, mimetype="application/octet-stream", chunksize=CHUNK_SIZE, resumable=True)
         request = api.videos().insert(part="snippet,status", body={
             "snippet": {"title": job.title, "description": job.description, "categoryId": "22"},
             "status": {"privacyStatus": job.privacy},
         }, media_body=media, notifySubscribers=False)
         retries, sent, started, attempted = 0, 0, time.monotonic(), False
+        transport = UploadTransport(request.http, job.attempt_id)
+        LOGGER.info("Upload started attempt=%s bytes=%d chunk_bytes=%d", job.attempt_id, job.size, CHUNK_SIZE)
+
+        def report_progress(progress):
+            nonlocal sent, retries
+            if progress is None:
+                return
+            confirmed = progress.resumable_progress
+            if confirmed > sent:
+                retries = 0  # Separate interruptions in a long upload get their own budget.
+            sent = confirmed
+            elapsed = max(time.monotonic() - started, 0.001)
+            rate = sent / elapsed
+            LOGGER.info("Upload progress attempt=%s bytes=%d total=%d", job.attempt_id, sent, job.size)
+            emit("progress", {"attempt_id": job.attempt_id, "recording_id": job.recording_id,
+                              "bytes": sent, "rate": rate, "eta": (job.size - sent) / rate if rate else None})
+
         while True:
             if stopping.is_set():
                 raise UploadFailure("Upload interrupted. Check YouTube Studio before starting another attempt.", attempted)
@@ -241,25 +314,45 @@ def upload_video(api, job: UploadJob, stopping: threading.Event, emit) -> dict:
                 if Snapshot.read(Path(job.path)).version != (job.identity, job.size, job.mtime_ns):
                     raise UploadFailure("Source changed during upload. Check YouTube Studio before retrying.", attempted)
                 attempted = True
-                progress, result = request.next_chunk(num_retries=0)
+                progress, result = request.next_chunk(http=transport, num_retries=0)
             except UploadFailure:
                 raise
             except Exception as exc:
+                status = exc.resp.status if isinstance(exc, HttpError) else None
+                LOGGER.warning("Upload exception attempt=%s type=%s status=%s retries=%d",
+                               job.attempt_id, type(exc).__name__, status, retries)
                 transient = (isinstance(exc, (OSError, httplib2.HttpLib2Error))
-                             or isinstance(exc, HttpError) and exc.resp.status in {429, 500, 502, 503, 504})
-                if transient and request.resumable_uri and retries < 5:
+                             or status in {408, 429, 500, 502, 503, 504})
+                can_retry = transient and bool(request.resumable_uri) and retries < MAX_RETRIES
+                if can_retry:
                     retries += 1
+                    delay = max(min(2 ** retries, 30), transport.retry_after)
+                    LOGGER.info("Upload retry attempt=%s count=%d delay_seconds=%.1f", job.attempt_id, retries, delay)
                     emit("retry", {"attempt_id": job.attempt_id, "count": retries})
-                    stopping.wait(min(2 ** retries, 30))
-                    continue
-                ambiguous = not isinstance(exc, HttpError) or exc.resp.status >= 500 or bool(request.resumable_uri)
-                raise UploadFailure(safe_error(exc), ambiguous) from None
-            if progress:
-                sent = progress.resumable_progress
-                elapsed = max(time.monotonic() - started, 0.001)
-                rate = sent / elapsed
-                emit("progress", {"attempt_id": job.attempt_id, "recording_id": job.recording_id,
-                                  "bytes": sent, "rate": rate, "eta": (job.size - sent) / rate if rate else None})
+                    stopping.wait(delay)
+                progress, result = None, None
+                # Always check completion, even for a non-retryable exception or
+                # exhausted retries. A lost final response must not cause a duplicate.
+                if request.resumable_uri:
+                    try:
+                        progress, result = probe_upload(request, transport)
+                    except Exception as probe_error:
+                        LOGGER.warning("Upload status check failed attempt=%s type=%s status=%s",
+                                       job.attempt_id, type(probe_error).__name__,
+                                       probe_error.resp.status if isinstance(probe_error, HttpError) else None)
+                        # A failed status query must remain a query on the next call.
+                        request._in_error_state = True
+                        if isinstance(probe_error, HttpError) and probe_error.resp.status in {404, 410}:
+                            can_retry = False
+                    if progress is not None and progress.resumable_progress > sent and transient:
+                        can_retry = True  # Even the final query can confirm renewed progress.
+                    report_progress(progress)
+                    progress = None
+                if result is None and not can_retry:
+                    ambiguous = not isinstance(exc, HttpError) or exc.resp.status >= 500 or bool(request.resumable_uri)
+                    LOGGER.warning("Upload stopped attempt=%s ambiguous=%s bytes=%d", job.attempt_id, ambiguous, sent)
+                    raise UploadFailure(safe_error(exc), ambiguous) from None
+            report_progress(progress)
             if result is not None:
                 video_id = result.get("id")
                 if not isinstance(video_id, str) or not video_id:
@@ -267,14 +360,18 @@ def upload_video(api, job: UploadJob, stopping: threading.Event, emit) -> dict:
                 outcome = {"attempt_id": job.attempt_id, "recording_id": job.recording_id,
                            "video_id": video_id, "url": f"https://www.youtube.com/watch?v={video_id}", "warning": ""}
                 emit("created", outcome.copy())  # Persist success before the optional playlist operation.
+                LOGGER.info("Upload completed attempt=%s bytes=%d", job.attempt_id, job.size)
                 if job.playlist_id and not stopping.is_set():
                     try:
                         api.playlistItems().insert(part="snippet", body={"snippet": {
                             "playlistId": job.playlist_id,
                             "resourceId": {"kind": "youtube#video", "videoId": video_id},
                         }}).execute(num_retries=0)
-                    except Exception:
+                    except Exception as exc:
+                        LOGGER.warning("Upload playlist exception attempt=%s type=%s", job.attempt_id, type(exc).__name__)
                         outcome["warning"] = "Video uploaded, but playlist placement was not confirmed. Check the playlist manually."
                 elif job.playlist_id:
                     outcome["warning"] = "Video uploaded; playlist placement was skipped during shutdown."
                 return outcome
+            if transport.retry_after and not stopping.is_set():
+                stopping.wait(transport.retry_after)

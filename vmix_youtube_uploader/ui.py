@@ -334,6 +334,7 @@ class QueueWindow(QWidget):
     review_requested = Signal(int)
     settings_requested = Signal()
     scan_requested = Signal()
+    add_video_requested = Signal(str)
 
     def __init__(self):
         super().__init__()
@@ -358,7 +359,7 @@ class QueueWindow(QWidget):
         self.error.setStyleSheet("color: #ac2424")
         layout.addWidget(self.error)
         self.table = QTableWidget(0, 7)
-        self.table.setHorizontalHeaderLabels(["Filename", "Directory", "Date detected", "Size", "Status", "Progress", "YouTube"])
+        self.table.setHorizontalHeaderLabels(["Filename", "Directory", "Date detected", "Size", "Status", "Upload %", "YouTube"])
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -368,6 +369,10 @@ class QueueWindow(QWidget):
         self.table.sortItems(2, Qt.SortOrder.DescendingOrder)
         layout.addWidget(self.table)
         actions = QHBoxLayout()
+        self.add_video_button = QPushButton("Add Video")
+        self.add_video_button.setToolTip("Choose a finished video to add to the queue without a recording trigger.")
+        self.add_video_button.clicked.connect(self.add_video)
+        actions.addWidget(self.add_video_button)
         self.review_button = QPushButton("Upload")
         self.review_button.setToolTip("Open upload confirmation for the selected file.")
         self.review_button.clicked.connect(self.review)
@@ -383,6 +388,19 @@ class QueueWindow(QWidget):
     def showEvent(self, event) -> None:
         super().showEvent(event)
         self.scan_requested.emit()
+
+    def add_video(self) -> None:
+        patterns = " ".join(f"*{extension}" for extension in EXTENSION_CHOICES)
+        path, _ = QFileDialog.getOpenFileName(self, "Add video to upload queue", "", f"Video files ({patterns})")
+        if path:
+            self.add_video_requested.emit(path)
+
+    def select_record(self, record_id: int) -> None:
+        for row in range(self.table.rowCount()):
+            if self.table.item(row, 0).data(Qt.ItemDataRole.UserRole) == record_id:
+                self.table.selectRow(row)
+                self.table.scrollToItem(self.table.item(row, 0))
+                break
 
     def selected(self) -> Recording | None:
         rows = self.table.selectionModel().selectedRows()
@@ -416,14 +434,15 @@ class QueueWindow(QWidget):
                 status += " (Later)"
             directory = Path(record.path).parent
             progress = (100.0 if record.status == Status.UPLOADED else
-                        100 * record.bytes_uploaded / record.size if record.size and record.bytes_uploaded else -1.0)
+                        min(99.9, max(0.0, 100 * record.bytes_uploaded / record.size)) if record.size and
+                        (record.bytes_uploaded or record.status in {Status.APPROVED, Status.UPLOADING}) else -1.0)
             columns = [
                 (Path(record.path).name if record.path else record.title, (Path(record.path).name if record.path else record.title).casefold()),
                 ((directory.name or str(directory)) if record.path else "—", (directory.name or str(directory)).casefold()),
                 (local_time(record.detected_at), datetime.fromisoformat(record.detected_at).timestamp()),
                 (size_text(record.size), record.size),
                 (status, status.casefold()),
-                (f"{progress:.0f}%" if progress >= 0 else "—", progress),
+                (f"{progress:.1f}%" if progress >= 0 else "—", progress),
                 (record.youtube_url or "—", record.youtube_url or ""),
             ]
             for column, (text, sort_value) in enumerate(columns):

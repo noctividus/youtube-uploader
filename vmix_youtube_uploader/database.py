@@ -138,6 +138,12 @@ class Database:
                 (int(available), now(), record_id, int(available)),
             )
 
+    def mark_manual(self, record_id: int) -> None:
+        with self.connection:
+            self.connection.execute("""UPDATE recordings SET source='manual',
+                hidden=0, deferred=0, status=CASE WHEN status=? THEN ? ELSE status END,
+                updated_at=? WHERE id=?""", (Status.SKIPPED, Status.WAITING, now(), record_id))
+
     def waiting(self, record_id: int) -> None:
         with self.connection:
             self.connection.execute("""

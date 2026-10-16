@@ -4,7 +4,7 @@ from PyInstaller.utils.hooks import collect_data_files, copy_metadata
 root = Path(SPECPATH).parent
 datas = [(str(root / "vmix_youtube_uploader" / "assets" / "app.ico"), "vmix_youtube_uploader/assets")]
 datas += collect_data_files("googleapiclient", includes=["discovery_cache/documents/youtube.v3.json"])
-for package in ("google-api-python-client", "google-auth", "keyring"):
+for package in ("google-api-python-client", "google-auth-httplib2", "httplib2", "google-auth", "keyring"):
     datas += copy_metadata(package)
 
 a = Analysis(

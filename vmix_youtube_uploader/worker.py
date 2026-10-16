@@ -15,6 +15,7 @@ from .config import Settings, load_settings, save_settings
 from .database import Database
 from .files import revalidate
 from .monitor import Monitor
+from .manual import ManualQueue
 from .vmix import VmixClient, VmixMonitor
 from .youtube_service import YouTubeService
 from .webhooks import Webhooks
@@ -43,6 +44,7 @@ class Worker(QThread):
     recording_stopped = Signal(int)
     youtube_state = Signal(object)
     upload_progress = Signal(object)
+    manual_added = Signal(int)
     upload_outcome = Signal(object)
     webhook_status = Signal(str)
 
@@ -168,6 +170,8 @@ class Worker(QThread):
                 self.webhook_status.emit("Webhook outbox unavailable. Check local storage and restart to retry.")
             self.settings_changed.emit(settings)
             monitor = Monitor(database, settings)
+            manual = ManualQueue(database)
+            next_manual_check = 0.0
             vmix = VmixMonitor(database, settings)
             client = VmixClient()
             next_poll = 0.0
@@ -183,6 +187,12 @@ class Worker(QThread):
                     try:
                         if command == "youtube_event":
                             self._youtube_event(database, *payload)
+                        elif command == "add_video":
+                            record_id = manual.add(payload, settings.description)
+                            monitor.auto_review_ids.discard(record_id)
+                            self.filesystem_announced.discard(record_id)
+                            self.records_changed.emit(database.all())
+                            self.manual_added.emit(record_id)
                         elif command == "youtube":
                             if self.youtube_busy:
                                 raise ValueError("Wait for the current YouTube operation to finish.")
@@ -255,6 +265,9 @@ class Worker(QThread):
                         self.error.emit(str(exc))
                         self._webhook("error", operation=command, message="Application operation failed; check the app.")
                 clock = time.monotonic()
+                if clock >= next_manual_check:
+                    manual.refresh()
+                    next_manual_check = clock + 1
                 # A long scheduling gap (e.g. sleep) is not observed stability.
                 if clock - last_tick > max(10, settings.vmix_poll_seconds * 2):
                     monitor.tracker.reset()

@@ -45,7 +45,8 @@ class Monitor:
     def tick(self, clock: float, scan: bool = False,
              stopped: Callable[[], bool] = lambda: False) -> list[int]:
         records = self.database.all(include_hidden=True)
-        paths = {record.path for record in records}
+        paths = {record.path for record in records if record.source != "manual"}
+        manual_paths = {record.path for record in records if record.source == "manual"}
         errors = []
         watched_scopes = self.watched_scopes()
         scanned_scopes: set[tuple[str, str]] = set()
@@ -70,12 +71,16 @@ class Monitor:
         ready = []
         # Check existing records even with periodic discovery disabled.
         for path in sorted(paths):
+            if path in manual_paths:
+                continue
             if stopped():
                 return ready
             try:
                 snapshot = Snapshot.read(Path(path))
                 seen.add(snapshot.identity)
                 record = self.database.observe(snapshot, self.settings.description)
+                if record.source == "manual":
+                    continue
                 scope = self.scope(snapshot.path)
                 previous = self.observed_versions.get(snapshot.identity)
                 if (scope in watched_scopes and scope in self.baselined_scopes
@@ -97,6 +102,8 @@ class Monitor:
             except OSError:
                 log.debug("File unavailable: %s", path, exc_info=True)
         for record in self.database.all(include_hidden=True):
+            if record.source == "manual":
+                continue
             available = record.identity in seen
             self.database.available(record.id, available)
             if not available:

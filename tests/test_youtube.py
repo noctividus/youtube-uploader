@@ -110,13 +110,15 @@ def test_network_retry_uses_same_resumable_request(database, tmp_path):
     api, request = fake_api()
     request.next_chunk.side_effect = [OSError("secret URL"),
         (SimpleNamespace(resumable_progress=4), None), (None, {"id": "video123"})]
+    request.http.request.return_value = (httplib2.Response({"status": "308", "range": "bytes=0-1"}), b"")
+    request._process_response.return_value = (SimpleNamespace(resumable_progress=2), None)
     stopping = Mock()
     stopping.is_set.return_value = False
     events = []
     upload_video(api, job, stopping, lambda *event: events.append(event))
     assert api.videos.return_value.insert.call_count == 1
     assert request.next_chunk.call_count == 3
-    assert [kind for kind, _ in events] == ["retry", "progress", "created"]
+    assert [kind for kind, _ in events] == ["retry", "progress", "progress", "created"]
 
 
 def test_google_transport_recovers_lost_final_response_without_new_insert(database, tmp_path):
@@ -138,7 +140,8 @@ def test_google_transport_recovers_lost_final_response_without_new_insert(databa
     assert outcome["video_id"] == "already-created"
     assert http.request.call_count == 3
     recovery = http.request.call_args
-    assert recovery.args[:2] == ("https://upload.example/session", "PUT")
+    assert recovery.args[0] == "https://upload.example/session"
+    assert recovery.kwargs["method"] == "PUT"
     assert recovery.kwargs["headers"]["Content-Range"] == f"bytes */{job.size}"
     assert api.videos.return_value.insert.call_count == 1
 
@@ -352,3 +355,194 @@ def test_worker_uploads_only_after_approval_and_persists_result(app, tmp_path, m
         assert persisted.all()[0].status == Status.UPLOADED
     finally:
         persisted.close()
+
+# Exercise the actual Google HttpRequest parser, with only HTTP I/O simulated.
+def scripted_upload(api, responses):
+    http = Mock()
+    http.request.side_effect = responses
+    def insert(**kwargs):
+        return HttpRequest(http, JsonModel().response, "https://www.googleapis.com/upload/youtube/v3/videos",
+                           method="POST", body=json.dumps(kwargs["body"]), resumable=kwargs["media_body"])
+    api.videos.return_value.insert.side_effect = insert
+    stopping = Mock()
+    stopping.is_set.return_value = False
+    return http, stopping
+
+
+def response(status, content=b"", **headers):
+    return httplib2.Response({"status": str(status), **headers}), content
+
+
+def test_real_transport_passes_308_without_location_and_keeps_normal_redirects(monkeypatch):
+    from vmix_youtube_uploader.youtube import upload_http
+    http = upload_http()
+    assert http.redirect_codes == httplib2.Http().redirect_codes - {308}
+    assert http.timeout == 120
+    # Mock only socket I/O; httplib2's real redirect logic is exercised.
+    conn = Mock()
+    http.connections["https:upload.example"] = conn
+    io = Mock(side_effect=[response(308, range="bytes=0-7"),
+                           response(302, location="https://upload.example/next"), response(200)])
+    monkeypatch.setattr(http, "_conn_request", io)
+    resp, _ = http.request("https://upload.example/session", method="PUT", body=b"12345678")
+    assert resp.status == 308
+    resp, _ = http.request("https://upload.example/redirect")
+    assert resp.status == 200 and io.call_count == 3
+
+
+def test_api_uses_configured_transport(monkeypatch):
+    from vmix_youtube_uploader import youtube
+    from google.oauth2.credentials import Credentials
+    build = Mock()
+    monkeypatch.setattr(youtube, "build", build)
+    youtube.youtube_api(Credentials("test-token"))
+    http = build.call_args.kwargs["http"].http
+    assert 308 not in http.redirect_codes and 302 in http.redirect_codes
+
+
+def test_multichunk_upload_uses_confirmed_offsets(database, tmp_path, caplog):
+    from vmix_youtube_uploader.youtube import CHUNK_SIZE
+    import logging
+    path = tmp_path / "large.mp4"
+    path.write_bytes(b"x" * (CHUNK_SIZE * 2 + 17))
+    record = database.observe(Snapshot.read(path), "")
+    database.ready(record.id, sampled_fingerprint(path, record.size))
+    job = approve(database, database.get(record.id))
+    api, _ = fake_api()
+    http, stopping = scripted_upload(api, [
+        response(200, location="https://upload.example/SECRET-session"),
+        response(308, range=f"bytes=0-{CHUNK_SIZE - 1}"),
+        response(308, range=f"bytes=0-{CHUNK_SIZE * 2 - 1}"),
+        response(201, b'{"id":"finished"}')])
+    events = []
+    def emit(kind, data):
+        events.append((kind, data))
+        database.upload_event(kind, data)
+    with caplog.at_level(logging.INFO):
+        outcome = upload_video(api, job, stopping, emit)
+    assert outcome["video_id"] == "finished"
+    ranges = [c.kwargs["headers"].get("Content-Range") for c in http.request.call_args_list[1:]]
+    assert ranges == [f"bytes 0-{CHUNK_SIZE-1}/{job.size}",
+                      f"bytes {CHUNK_SIZE}-{CHUNK_SIZE*2-1}/{job.size}",
+                      f"bytes {CHUNK_SIZE*2}-{job.size-1}/{job.size}"]
+    assert [d["bytes"] for k, d in events if k == "progress"] == [CHUNK_SIZE, CHUNK_SIZE*2]
+    assert database.get(job.recording_id).status == Status.UPLOADED
+    assert "status=308" in caplog.text and "status=201" in caplog.text
+    assert "SECRET" not in caplog.text and "upload.example" not in caplog.text
+
+
+@pytest.mark.parametrize("accepted", [0, 5])
+def test_recovery_uses_server_range_not_last_sent_chunk(database, tmp_path, accepted):
+    job = approve(database, ready(database, tmp_path))
+    api, _ = fake_api()
+    range_header = {"range": f"bytes=0-{accepted-1}"} if accepted else {}
+    http, stopping = scripted_upload(api, [
+        response(200, location="https://upload.example/session"), OSError("secret"),
+        response(308, **range_header), response(201, b'{"id":"resumed"}')])
+    events = []
+    assert upload_video(api, job, stopping, lambda *e: events.append(e))["video_id"] == "resumed"
+    assert http.request.call_args.kwargs["headers"]["Content-Range"] == f"bytes {accepted}-{job.size-1}/{job.size}"
+    assert [d["bytes"] for k, d in events if k == "progress"] == [accepted]
+    assert api.videos.return_value.insert.call_count == 1
+
+
+def test_separate_interruptions_reset_retry_budget(database, tmp_path):
+    job = approve(database, ready(database, tmp_path))
+    api, _ = fake_api()
+    replies = [response(200, location="https://upload.example/session")]
+    for accepted in range(1, 8):
+        replies.extend([response(503), response(308, range=f"bytes=0-{accepted-1}")])
+    replies.append(response(201, b'{"id":"resumed"}'))
+    _, stopping = scripted_upload(api, replies)
+    events = []
+    upload_video(api, job, stopping, lambda *e: events.append(e))
+    assert [d["count"] for k, d in events if k == "retry"] == [1] * 7
+    assert api.videos.return_value.insert.call_count == 1
+
+
+@pytest.mark.parametrize("failure", [ValueError("SECRET parse error"), response(403)])
+def test_nonretryable_exception_still_checks_completion(database, tmp_path, failure):
+    job = approve(database, ready(database, tmp_path))
+    api, _ = fake_api()
+    http, stopping = scripted_upload(api, [response(200, location="https://upload.example/session"),
+        failure, response(201, b'{"id":"already-created"}')])
+    assert upload_video(api, job, stopping, lambda *_: None)["video_id"] == "already-created"
+    assert http.request.call_args.kwargs["headers"]["Content-Range"] == f"bytes */{job.size}"
+    assert api.videos.return_value.insert.call_count == 1
+
+
+@pytest.mark.parametrize("completed", [True, False])
+def test_exhausted_retries_get_final_status_check(database, tmp_path, completed, caplog):
+    job = approve(database, ready(database, tmp_path))
+    api, _ = fake_api()
+    replies = [response(200, location="https://upload.example/SECRET")]
+    for _ in range(5):
+        replies.extend([OSError("SECRET token"), response(308)])
+    replies.extend([OSError("SECRET token"), response(201, b'{"id":"completed"}') if completed else response(404)])
+    http, stopping = scripted_upload(api, replies)
+    if completed:
+        assert upload_video(api, job, stopping, lambda *_: None)["video_id"] == "completed"
+    else:
+        with pytest.raises(UploadFailure) as exc:
+            upload_video(api, job, stopping, lambda *_: None)
+        assert exc.value.ambiguous
+    assert stopping.wait.call_count == 5
+    assert http.request.call_args.kwargs["headers"]["Content-Range"] == f"bytes */{job.size}"
+    assert api.videos.return_value.insert.call_count == 1
+    assert "SECRET" not in caplog.text
+
+
+def test_failed_probe_does_not_blindly_resend_media(database, tmp_path):
+    job = approve(database, ready(database, tmp_path))
+    api, _ = fake_api()
+    http, stopping = scripted_upload(api, [response(200, location="https://upload.example/session"),
+        OSError("lost reply"), OSError("probe offline"), response(201, b'{"id":"completed"}')])
+    assert upload_video(api, job, stopping, lambda *_: None)["video_id"] == "completed"
+    for call in http.request.call_args_list[-2:]:
+        assert call.kwargs["headers"]["Content-Range"] == f"bytes */{job.size}"
+        assert call.kwargs["body"] is None
+
+
+def test_retry_after_honored(database, tmp_path):
+    job = approve(database, ready(database, tmp_path))
+    api, _ = fake_api()
+    _, stopping = scripted_upload(api, [response(200, location="https://upload.example/session"),
+        response(429, **{"retry-after": "45"}), response(201, b'{"id":"completed"}')])
+    upload_video(api, job, stopping, lambda *_: None)
+    stopping.wait.assert_called_once_with(45)
+
+
+def test_http_library_response_bodies_are_not_logged(tmp_path):
+    import logging
+    from vmix_youtube_uploader.logging_setup import configure_logging
+    root = logging.getLogger()
+    old_handlers, old_level = list(root.handlers), root.level
+    library = logging.getLogger("googleapiclient.http")
+    old_disabled = library.disabled
+    try:
+        configure_logging(tmp_path / "logs")
+        library.warning("Invalid JSON content from response: SECRET-token-upload-url")
+        logging.getLogger("vmix_youtube_uploader.youtube").warning("Upload exception type=OSError status=503")
+        log = (tmp_path / "logs/uploader.log").read_text(encoding="utf-8")
+        assert "SECRET" not in log
+        assert "status=503" in log
+    finally:
+        for handler in list(root.handlers):
+            if handler not in old_handlers:
+                root.removeHandler(handler)
+                handler.close()
+        root.setLevel(old_level)
+        library.disabled = old_disabled
+
+
+def test_final_status_progress_renews_retry_allowance(database, tmp_path):
+    job = approve(database, ready(database, tmp_path))
+    api, _ = fake_api()
+    replies = [response(200, location="https://upload.example/session")]
+    for _ in range(5):
+        replies.extend([OSError("offline"), response(308)])
+    replies.extend([OSError("lost reply"), response(308, range="bytes=0-7"),
+                    response(201, b'{"id":"completed"}')])
+    http, stopping = scripted_upload(api, replies)
+    assert upload_video(api, job, stopping, lambda *_: None)["video_id"] == "completed"
+    assert http.request.call_args.kwargs["headers"]["Content-Range"] == f"bytes 8-{job.size-1}/{job.size}"
